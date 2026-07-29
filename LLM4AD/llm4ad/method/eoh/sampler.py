@@ -16,7 +16,7 @@ class EoHSampler:
     def get_thought_and_function(self, prompt: str) -> Tuple[str, Function]:
         response = self.llm.draw_sample(prompt)
         thought = self.__class__.trim_thought_from_response(response)
-        code = SampleTrimmer.trim_preface_of_function(response)
+        code = self.__class__.trim_code_from_response(response)
 
         function = SampleTrimmer.sample_to_function(code, self._template_program)
         return thought, function
@@ -24,8 +24,15 @@ class EoHSampler:
     @classmethod
     def trim_thought_from_response(cls, response: str) -> str | None:
         try:
-            pattern = r'\{.*?\}'  # Compared with r'\{(.*)\}'
-            bracketed_texts = re.findall(pattern, response)
-            return bracketed_texts[0]
+            match = re.search(r'(?is)\bthought\s*:\s*(\{.*?\})', response)
+            return match.group(1) if match else None
         except:
             return None
+
+    @classmethod
+    def trim_code_from_response(cls, response: str) -> str:
+        """Extract a function body from either fenced or plain LLM output."""
+        match = re.search(r'```(?:python)?\s*(.*?)```', response, flags=re.IGNORECASE | re.DOTALL)
+        code = match.group(1) if match else response
+        code = re.sub(r'^\s*Code\s*:\s*\n?', '', code, flags=re.IGNORECASE)
+        return SampleTrimmer.trim_preface_of_function(code)

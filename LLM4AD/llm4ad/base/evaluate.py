@@ -33,7 +33,7 @@ import traceback
 class Evaluation(ABC):
     def __init__(
             self,
-            template_program: str | Program,
+            template_program: str = '',
             task_description: str = '',
             use_numba_accelerate: bool = False,
             use_protected_div: bool = False,

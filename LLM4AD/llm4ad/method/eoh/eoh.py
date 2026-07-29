@@ -55,7 +55,7 @@ class EoH:
                  use_m2_operator: bool = True,
                  num_samplers: int = 1,
                  num_evaluators: int = 1,
-                 *,
+                 info: dict | None = None,
                  resume_mode: bool = False,
                  debug_mode: bool = False,
                  multi_thread_or_process_eval: Literal['thread', 'process'] = 'thread',
@@ -83,8 +83,8 @@ class EoH:
                 and you set this argument to 'thread'.
             **kwargs                    : some args pass to 'llm4ad.base.SecureEvaluator'. Such as 'fork_proc'.
         """
-        self._template_program_str = evaluation.template_program
-        self._task_description_str = evaluation.task_description
+        self._info = dict(info or {})
+        self._template_program_str = self._info['template_program']
         self._max_generations = max_generations
         self._max_sample_nums = max_sample_nums
         self._pop_size = pop_size
@@ -100,10 +100,7 @@ class EoH:
         self._debug_mode = debug_mode
         llm.debug_mode = debug_mode
         self._multi_thread_or_process_eval = multi_thread_or_process_eval
-
         # function to be evolved
-        self._function_to_evolve: Function = TextFunctionProgramConverter.text_to_function(self._template_program_str)
-        self._function_to_evolve_name: str = self._function_to_evolve.name
         self._template_program: Program = TextFunctionProgramConverter.text_to_program(self._template_program_str)
 
         # adjust population size
@@ -216,7 +213,7 @@ class EoH:
             try:
                 # get a new func using e1
                 indivs = [self._population.selection() for _ in range(self._selection_num)]
-                prompt = EoHPrompt.get_prompt_e1(self._task_description_str, indivs, self._function_to_evolve)
+                prompt = EoHPrompt.get_prompt_e1(indivs, self._info)
                 if self._debug_mode:
                     print(f'E1 Prompt: {prompt}')
                 self._sample_evaluate_register(prompt)
@@ -226,7 +223,7 @@ class EoH:
                 # get a new func using e2
                 if self._use_e2_operator:
                     indivs = [self._population.selection() for _ in range(self._selection_num)]
-                    prompt = EoHPrompt.get_prompt_e2(self._task_description_str, indivs, self._function_to_evolve)
+                    prompt = EoHPrompt.get_prompt_e2(indivs, self._info)
                     if self._debug_mode:
                         print(f'E2 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt)
@@ -236,7 +233,7 @@ class EoH:
                 # get a new func using m1
                 if self._use_m1_operator:
                     indiv = self._population.selection()
-                    prompt = EoHPrompt.get_prompt_m1(self._task_description_str, indiv, self._function_to_evolve)
+                    prompt = EoHPrompt.get_prompt_m1(indiv, self._info)
                     if self._debug_mode:
                         print(f'M1 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt)
@@ -246,7 +243,7 @@ class EoH:
                 # get a new func using m2
                 if self._use_m2_operator:
                     indiv = self._population.selection()
-                    prompt = EoHPrompt.get_prompt_m2(self._task_description_str, indiv, self._function_to_evolve)
+                    prompt = EoHPrompt.get_prompt_m2(indiv, self._info)
                     if self._debug_mode:
                         print(f'M2 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt)
@@ -273,7 +270,7 @@ class EoH:
         while self._population.generation == 0:
             try:
                 # get a new func using i1
-                prompt = EoHPrompt.get_prompt_i1(self._task_description_str, self._function_to_evolve)
+                prompt = EoHPrompt.get_prompt_i1(self._info)
                 self._sample_evaluate_register(prompt)
                 if self._tot_sample_nums >= self._initial_sample_nums_max:
                     # print(f'Warning: Initialization not accomplished in {self._initial_sample_nums_max} samples !!!')
