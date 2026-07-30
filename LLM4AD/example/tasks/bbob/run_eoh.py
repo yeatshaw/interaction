@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # Always resolve imports from the LLM4AD project root, independent of cwd.
@@ -10,6 +11,7 @@ from llm4ad.tools.llm.llm_api_https import HttpsApi
 from llm4ad.tools.profiler import ProfilerBase
 from llm4ad.method.eoh import EoH, EoHProfiler
 from utils import get_info
+from operator_statistics_report import main as build_statistics_report
 
 
 def main():
@@ -19,7 +21,11 @@ def main():
                    timeout=120)
     method_name = 'mutate'
     info = get_info(method_name)
-    task = BBOBEvaluationINI(method_name=method_name)
+    run_name = f'{datetime.now():%Y%m%d_%H%M%S}_{method_name}'
+    task = BBOBEvaluationINI(
+        method_name=method_name,
+        statistics_dir=Path(__file__).resolve().parent / 'operator_statistics_results' / run_name,
+    )
 
     method = EoH(llm=llm,
                  profiler=EoHProfiler(log_dir='logs/eoh', log_style='complex'),
@@ -33,6 +39,7 @@ def main():
                  debug_mode=False)
 
     method.run()
+    build_statistics_report(task.statistics_dir)
 
 if __name__ == '__main__':
     main()

@@ -44,6 +44,7 @@ import multiprocessing as mp
 
 
 from llm4ad.task.optimization.bbob.lshade import *
+from llm4ad.task.optimization.bbob.operator_statistics_plugin import install_fixed_operator_recorders
 
 
 # Define the GNBG class
@@ -122,7 +123,8 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 folder_path = os.path.join(current_dir)
 
 
-def run_single(problem_index, run_index, random_seed, func, method_name='mutate'):
+def run_single(problem_index, run_index, random_seed, func, method_name='mutate',
+               statistics_dir=None, candidate_id=None):
 
     np.random.seed(random_seed)  # This uses a system-based source to seed the random number generator
 
@@ -176,6 +178,8 @@ def run_single(problem_index, run_index, random_seed, func, method_name='mutate'
     if not hasattr(de, method_name):
         raise ValueError(f'LSHADE does not define method {method_name!r}.')
     setattr(de, method_name, types.MethodType(program_callable, de))
+    if statistics_dir and candidate_id:
+        install_fixed_operator_recorders(statistics_dir, candidate_id, method_name, de)
     de.optimize()
 
     convergence = []
@@ -189,11 +193,12 @@ def run_single(problem_index, run_index, random_seed, func, method_name='mutate'
     return abs(gnbg.BestFoundResult - OptimumValue)
 
 
-def main(num_process=1, total_runs=5, test_problems=None, random_seed=None, func=None, method_name='mutate'):
+def main(num_process=1, total_runs=5, test_problems=None, random_seed=None, func=None,
+         method_name='mutate', statistics_dir=None, candidate_id=None):
     debug_mode = False 
     if debug_mode:
     # parallel run 31 runs for run single for 24 problems each
-        results = run_single(13, 0, 0, func, method_name)
+        results = run_single(13, 0, 0, func, method_name, statistics_dir, candidate_id)
         
     else:
         total_runs = 5
@@ -201,7 +206,11 @@ def main(num_process=1, total_runs=5, test_problems=None, random_seed=None, func
         test_problems = [13]
         num_processes = mp.cpu_count()  # Get the number of available CPU cores
         with mp.Pool(processes=min(num_processes, total_runs)) as pool:
-            results = pool.starmap(run_single, [(problem_index, run_index, random_seed[run_index], func, method_name) for run_index in range(total_runs) for problem_index in test_problems])
+            results = pool.starmap(run_single, [
+                (problem_index, run_index, random_seed[run_index], func, method_name,
+                 statistics_dir, candidate_id)
+                for run_index in range(total_runs) for problem_index in test_problems
+            ])
 
     return np.mean(results)
 

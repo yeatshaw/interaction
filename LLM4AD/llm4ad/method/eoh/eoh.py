@@ -192,7 +192,7 @@ class EoH:
             self._profiler.register_function(func, program=str(program))
             if isinstance(self._profiler, EoHProfiler):
                 self._profiler.register_population(self._population)
-            self._tot_sample_nums += 1
+        self._tot_sample_nums += 1
 
         # register to the population
         self._population.register_function(func)
