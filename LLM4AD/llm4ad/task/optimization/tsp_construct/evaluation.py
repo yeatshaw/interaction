@@ -33,6 +33,8 @@
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
+import pickle
+from pathlib import Path
 from typing import Any
 import numpy as np
 from llm4ad.base import Evaluation
@@ -49,6 +51,7 @@ class TSPEvaluation(Evaluation):
                  timeout_seconds=30,
                  n_instance=16,
                  problem_size=50,
+                 dataset_path: str | Path | None = None,
                  **kwargs):
 
         """
@@ -66,10 +69,54 @@ class TSPEvaluation(Evaluation):
             timeout_seconds=timeout_seconds
         )
 
-        self.n_instance = n_instance
-        self.problem_size = problem_size
-        getData = GetData(self.n_instance, self.problem_size)
-        self._datasets = getData.generate_instances()
+        if dataset_path is None:
+            self.n_instance = n_instance
+            self.problem_size = problem_size
+            getData = GetData(self.n_instance, self.problem_size)
+            self._datasets = getData.generate_instances()
+        else:
+            self._datasets = self._load_dataset(dataset_path)
+            self.n_instance = len(self._datasets)
+            self.problem_size = len(self._datasets[0][0])
+
+    @staticmethod
+    def _load_dataset(dataset_path: str | Path):
+        """Load trusted TSP instances and verify their structure."""
+        path = Path(dataset_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f'TSP dataset not found: {path}')
+
+        # Pickle files can execute code while loading. Only use a trusted dataset.
+        with path.open('rb') as file:
+            datasets = pickle.load(file)
+
+        if not isinstance(datasets, (list, tuple)) or not datasets:
+            raise ValueError('TSP dataset must be a non-empty list of instance pairs.')
+
+        validated = []
+        expected_size = None
+        for index, item in enumerate(datasets):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError(f'Instance {index} must contain coordinates and a distance matrix.')
+
+            coordinates = np.asarray(item[0], dtype=float)
+            distance_matrix = np.asarray(item[1], dtype=float)
+            if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+                raise ValueError(f'Instance {index} coordinates must have shape (n, 2).')
+
+            size = coordinates.shape[0]
+            if distance_matrix.shape != (size, size):
+                raise ValueError(f'Instance {index} distance matrix must have shape ({size}, {size}).')
+            if not np.isfinite(coordinates).all() or not np.isfinite(distance_matrix).all():
+                raise ValueError(f'Instance {index} contains non-finite values.')
+            if expected_size is None:
+                expected_size = size
+            elif size != expected_size:
+                raise ValueError('All TSP instances must have the same problem size.')
+
+            validated.append((coordinates, distance_matrix))
+
+        return validated
 
     def evaluate_program(self, program_str: str, callable_func: callable) -> Any | None:
         return self.evaluate(callable_func)

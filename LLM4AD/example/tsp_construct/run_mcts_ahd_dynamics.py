@@ -20,8 +20,16 @@ def main():
     api_key = os.environ.get('LLM4AD_API_KEY')
     if not api_key:
         raise RuntimeError('Set LLM4AD_API_KEY before running this experiment.')
+    train_data = os.environ.get('LLM4AD_TSP_TRAIN_DATA')
+    if not train_data:
+        raise RuntimeError('Set LLM4AD_TSP_TRAIN_DATA to the training dataset path.')
 
     log_dir = Path(os.environ.get('LLM4AD_LOG_DIR', 'logs/mcts_ahd_dynamics'))
+    evaluation = TSPEvaluation(dataset_path=train_data)
+    print(
+        f'Loaded {evaluation.n_instance} training instances '
+        f'with {evaluation.problem_size} cities from {train_data}'
+    )
     llm = HttpsApi(
         host=os.environ.get('LLM4AD_API_HOST', 'api.openai.com'),
         key=api_key,
@@ -30,7 +38,7 @@ def main():
     )
     method = MCTS_AHD(
         llm=llm,
-        evaluation=TSPEvaluation(),
+        evaluation=evaluation,
         profiler=ProfilerBase(log_dir=str(log_dir), log_style='complex'),
         dynamics_log_dir=str(log_dir / 'dynamics'),
         max_sample_nums=int(os.environ.get('LLM4AD_MAX_SAMPLES', '100')),
