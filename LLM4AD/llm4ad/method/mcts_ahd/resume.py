@@ -141,4 +141,6 @@ def resume_ma(ma: MCTS_AHD, path):
     _resume_pf(log_path, pf, template_func)
     # resume eoh
     _, _, sample_max_order, _ = _get_all_samples_and_scores(log_path)
-    ma._tot_sample_nums = sample_max_order
+    dynamics_samples, dynamics_evaluations = ma._dynamics.restore_from_logs()
+    ma._tot_sample_nums = max(sample_max_order, dynamics_samples)
+    ma._evaluation_nums = max(sample_max_order, dynamics_evaluations)

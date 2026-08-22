@@ -23,12 +23,20 @@
 # --------------------------------------------------------------------------
 
 from __future__ import annotations
+import itertools
 import math
 
 
 class MCTSNode:
+    _id_counter = itertools.count()
+
+    @classmethod
+    def reset_ids(cls):
+        cls._id_counter = itertools.count()
+
     def __init__(self, algorithm, code, obj, depth=0, individual=None, is_root=False, parent=None, visit=0,
-                 raw_info=None, Q=0):
+                 raw_info=None, Q=0, operator=None, round_id=None):
+        self.node_id = next(self._id_counter)
         self.algorithm = algorithm
         self.code = code
         self.parent = parent
@@ -40,6 +48,8 @@ class MCTSNode:
         self.raw_info = raw_info
         self.Q = Q
         self.reward = -1 * obj
+        self.operator = operator
+        self.round_id = round_id
 
     def add_child(self, child_node: MCTSNode):
         self.children.append(child_node)
@@ -47,6 +57,7 @@ class MCTSNode:
 
 class MCTS:
     def __init__(self, root_answer, alpha, lambad0):
+        MCTSNode.reset_ids()
         self.exploration_constant_0 = lambad0  # Paramter \lambda_0
         self.alpha = alpha  # Paramter \alpha
         self.max_depth = 10
@@ -81,7 +92,8 @@ class MCTS:
 
     def uct(self, node: MCTSNode, eval_remain):
         self.exploration_constant = (self.exploration_constant_0) * eval_remain
-        return (node.Q - self.q_min) / (self.q_max - self.q_min) + self.exploration_constant * math.sqrt(
+        q_range = max(self.q_max - self.q_min, self.epsilon)
+        return (node.Q - self.q_min) / q_range + self.exploration_constant * math.sqrt(
             math.log(node.parent.visits + 1) / node.visits
         )
 
