@@ -33,6 +33,9 @@
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
+import os
+import pickle
+from pathlib import Path
 from typing import Any
 import numpy as np
 from llm4ad.base import Evaluation
@@ -49,6 +52,7 @@ class TSPEvaluation(Evaluation):
                  timeout_seconds=30,
                  n_instance=16,
                  problem_size=50,
+                 dataset_path: str | Path | None = None,
                  **kwargs):
 
         """
@@ -66,10 +70,19 @@ class TSPEvaluation(Evaluation):
             timeout_seconds=timeout_seconds
         )
 
-        self.n_instance = n_instance
-        self.problem_size = problem_size
-        getData = GetData(self.n_instance, self.problem_size)
-        self._datasets = getData.generate_instances()
+        dataset_path = dataset_path or os.environ.get('LLM4AD_TSP_TRAIN_DATA')
+        if dataset_path:
+            with Path(dataset_path).expanduser().open('rb') as file:
+                self._datasets = pickle.load(file)
+            if not isinstance(self._datasets, (list, tuple)) or not self._datasets:
+                raise ValueError('TSP dataset must be a non-empty list of instance pairs.')
+            self.n_instance = len(self._datasets)
+            self.problem_size = len(self._datasets[0][0])
+        else:
+            self.n_instance = n_instance
+            self.problem_size = problem_size
+            getData = GetData(self.n_instance, self.problem_size)
+            self._datasets = getData.generate_instances()
 
     def evaluate_program(self, program_str: str, callable_func: callable) -> Any | None:
         return self.evaluate(callable_func)
