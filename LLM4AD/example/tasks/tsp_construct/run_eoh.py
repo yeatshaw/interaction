@@ -37,12 +37,12 @@ def main():
                  max_sample_nums=50,
                  max_generations=50,
                  pop_size=5,
-                 num_samplers=5,
-                 num_evaluators=5,
+                 num_samplers=1,
+                 num_evaluators=1,
                  reflection_input_mode=reflection_mode,
                  lineage_log_path=lineage_path,
                  info=info,
-                 debug_mode=False)
+                 debug_mode=True)
     method.run()
 
 if __name__ == '__main__':

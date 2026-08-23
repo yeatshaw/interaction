@@ -9,36 +9,53 @@ from ...base import *
 class EoHPrompt:
     @classmethod
     def get_prompt_reflection(cls, children, parents=None, mode: int = 4, info: dict | None = None) -> str:
-        """Ask for one concise improvement suggestion for the next algorithm."""
+        """Build the reflection prompt using the task template's path format."""
         task_prompt = info['task_description']
         children = children if isinstance(children, list) else [children]
         parents = parents or [[] for _ in children]
-        child_code = '\n\n'.join(f'Candidate {i + 1}:\n{item}' for i, item in enumerate(children))
-        child_thought = '\n\n'.join(f'Candidate {i + 1}:\n{getattr(item, "algorithm", "")}' for i, item in enumerate(children))
-        parent_code = '\n\n'.join(
-            f'Candidate {i + 1} parent(s):\n' + '\n\n'.join(str(parent) for parent in group)
-            for i, group in enumerate(parents) if group
-        )
-        parent_thought = '\n\n'.join(
-            f'Candidate {i + 1} parent thought(s):\n' + '\n\n'.join(getattr(parent, 'algorithm', '') for parent in group)
-            for i, group in enumerate(parents) if group
-        )
-        if mode == 1:
-            evidence = f'Child code:\n{child_code}'
-        elif mode == 2:
-            evidence = f'Child code:\n{child_code}\n\nChild thought:\n{child_thought}'
-        elif mode == 3:
-            evidence = f'Parent code(s):\n{parent_code}\n\nChild code:\n{child_code}'
-        elif mode == 4:
-            evidence = (f'Parent thought(s):\n{parent_thought}\n\nParent code(s):\n{parent_code}\n\n'
-                        f'Child thought:\n{child_thought}\n\nChild code:\n{child_code}')
+        def code_block(code, label='Code'):
+            return f'{label}:\n```python\n{code}\n```'
+
+        def child_section(item, index, include_thought):
+            prefix = f'## Algorithm {index} ##\n'
+            thought = f'thought: {getattr(item, "algorithm", "")}\n' if include_thought else ''
+            return prefix + thought + code_block(str(item))
+
+        if mode in (1, 2):
+            sections = '\n'.join(child_section(item, i + 1, mode == 2)
+                                  for i, item in enumerate(children))
+            evidence = (
+                'Here are a few pieces of algorithm code to complete the above tasks.\n'
+                if mode == 1 else
+                'Here are a few pieces of algorithm code and their corresponding thoughts to complete the above task.\n'
+            ) + sections
         else:
+            paths = []
+            for i, (child, group) in enumerate(zip(children, parents), 1):
+                multiple = len(group) > 1
+                refs = []
+                for j, parent in enumerate(group, 1):
+                    suffix = f' {j}' if multiple else ''
+                    thought = (f'thought{suffix}: {getattr(parent, "algorithm", "")}\n'
+                               if mode == 4 else '')
+                    refs.append(f'Code{suffix}:\n```python\n{parent}\n```' if mode == 3
+                                else thought + f'Code{suffix}:\n```python\n{parent}\n```')
+                new_thought = (f'thought: {getattr(child, "algorithm", "")}\n' if mode == 4 else '')
+                paths.append(
+                    f'## Evolution path {i} ##\n# Reference Algorithm #\n'
+                    + '\n'.join(refs) + '\n# New Algorithm #\n'
+                    + new_thought + code_block(str(child))
+                )
+            evidence = ('Here are the reference algorithm sets from the previous algorithm design and the new algorithms generated from them.\n'
+                        + '\n'.join(paths))
+        if mode not in (1, 2, 3, 4):
             raise ValueError('reflection_input_mode must be one of 1, 2, 3, or 4.')
-        return f'''{task_prompt}
-Extract the key reason in the subject algorithm that should guide the next code change, and turn it into one concrete improvement suggestion.
+        return f'''Task:{task_prompt}
 {evidence}
-{cls.requirements()}
-Output only the concise improvement suggestion. Do not output the subject-selection reason, analysis, code, thought, or multiple alternatives.'''
+Reflect requirement:
+1. Identify the most useful design insight from the provided algorithm(s).
+2. Just output one concrete improvement suggestion for the next code.
+'''
 
     @staticmethod
     def append_reflection(prompt: str, suggestion: str | None, requirements: str) -> str:
@@ -75,23 +92,27 @@ Use the following reflection as guidance for this generation:
     @staticmethod
     def _template_values(info: dict):
         """Build every prompt field from task metadata."""
-        required = ('method_name', 'method_args', 'class_args', 'func_template', 'method_signature')
+        required = ('method_name', 'func_template', 'method_signature')
         missing = [key for key in required if key not in info]
         if missing:
             raise ValueError(f'info is missing required fields: {", ".join(missing)}.')
         reply_template = (info['func_template']
                           .replace('<method_name>', info['method_name'])
                           .replace('<method_args>', info['method_signature']))
-        return info['method_name'], info['method_args'], reply_template, info['class_args']
+        class_args = info.get('class_args', '').strip()
+        method_args = info.get('method_args', '').strip()
+        class_section = (f'This is the information about the variables in this class:\n{class_args}'
+                         if class_args else '')
+        method_section = (f'These are the relevant parameters for this method:\n{method_args}'
+                          if method_args else '')
+        return info['method_name'], f'{method_section}', reply_template, f'{class_section}'
     
     @classmethod
     def get_prompt_i1(cls, info: dict | None = None):
         method_name, method_args, func_template, class_args = cls._template_values(info)
         task_prompt = info['task_description']
         prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
-This is the information about the variables in this class:
 {class_args}
-These are the relevant parameters for this method:
 {method_args}
 This is the format for your reply:
 {func_template}
@@ -114,9 +135,7 @@ Do not give additional explanations.'''
         prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
 I have {len(indivs)} implementations of this method with their codes as follows:
 {indivs_prompt}
-This is the information about the variables in this class:
 {class_args}
-These are the relevant parameters for this method:
 {method_args}
 This is the format for your reply:
 {func_template}
@@ -141,9 +160,7 @@ Do not give additional explanations.'''
         prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
 I have {len(indivs)} implementations of this method with their codes as follows:
 {indivs_prompt}
-This is the information about the variables in this class:
 {class_args}
-These are the relevant parameters for this method:
 {method_args}
 This is the format for your reply:
 {func_template}
@@ -163,9 +180,7 @@ Do not give additional explanations.'''
         prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
 I have a implementation of this method with its code as follows:
 {indiv_prompt}
-This is the information about the variables in this class:
 {class_args}
-These are the relevant parameters for this method:
 {method_args}
 This is the format for your reply:
 {func_template}
@@ -184,9 +199,7 @@ Do not give additional explanations.'''
         prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
 I have a implementation of this method with its code as follows:
 {indiv_prompt}
-This is the information about the variables in this class:
 {class_args}
-These are the relevant parameters for this method:
 {method_args}
 This is the format for your reply:
 {func_template}

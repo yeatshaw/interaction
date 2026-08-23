@@ -218,7 +218,8 @@ class SampleTrimmer:
             visitor = _FunctionLineVisitor('fake_function_header')
             visitor.visit(tree)
             body_lines = code.splitlines()[1:visitor.function_end_line]
-            return '\n'.join(body_lines) + '\n\n'
+            # Do not carry parser padding into the extracted function body.
+            return '\n'.join(body_lines).rstrip()
         except:
             return None
 
