@@ -26,9 +26,13 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
+import os
+import tempfile
 import time
 import traceback
-from threading import Thread
+import random
+from threading import Thread, Lock
 from typing import Optional, Literal
 
 from .population import Population
@@ -58,6 +62,8 @@ class EoH:
                  info: dict | None = None,
                  resume_mode: bool = False,
                  debug_mode: bool = False,
+                 reflection_input_mode: int = 4,
+                 lineage_log_path: str = 'eoh_lineage.json',
                  multi_thread_or_process_eval: Literal['thread', 'process'] = 'thread',
                  **kwargs):
         """Evolutionary of Heuristics.
@@ -98,6 +104,10 @@ class EoH:
         self._num_evaluators = num_evaluators
         self._resume_mode = resume_mode
         self._debug_mode = debug_mode
+        if reflection_input_mode not in (1, 2, 3, 4):
+            raise ValueError('reflection_input_mode must be one of 1, 2, 3, or 4.')
+        self._reflection_input_mode = reflection_input_mode
+        self._reflection_suggestion = None
         llm.debug_mode = debug_mode
         self._multi_thread_or_process_eval = multi_thread_or_process_eval
         # function to be evolved
@@ -108,6 +118,12 @@ class EoH:
 
         # population, sampler, and evaluator
         self._population = Population(pop_size=self._pop_size)
+        # The lineage DAG is persisted on disk; population survival remains the
+        # sole mechanism for evolution. Only the current population stays in RAM.
+        self._lineage_log_path = os.path.abspath(lineage_log_path)
+        self._next_lineage_id = 0
+        self._lineage_lock = Lock()
+        self._initialize_lineage_file()
         self._sampler = EoHSampler(llm, self._template_program_str)
         self._evaluator = SecureEvaluator(evaluation, debug_mode=debug_mode, **kwargs)
         self._profiler = profiler
@@ -163,21 +179,134 @@ class EoH:
                 print(f'Warning: population size {self._pop_size} '
                       f'is not suitable, please reset it to 5.')
 
-    def _sample_evaluate_register(self, prompt):
+    def _reflect(self, child, parents=None):
+        """Generate a compact suggestion; reflection text is not registered as a child."""
+        prompt = EoHPrompt.get_prompt_reflection(
+            child, parents, self._reflection_input_mode, self._info
+        )
+        try:
+            suggestion = self._sampler.llm.draw_sample(prompt)
+        except Exception:
+            if self._debug_mode:
+                traceback.print_exc()
+            return None
+        return suggestion.strip() if isinstance(suggestion, str) else None
+
+    def _prepare_reflection(self):
+        if not self._population.population:
+            return
+        count = random.randint(1, min(3, len(self._population.population)))
+        refs = random.sample(self._population.population, count)
+        # Use the best selected reference as the child when no fresh child exists.
+        child = max(refs, key=lambda item: item.score)
+        parents = [item for item in refs if item is not child]
+        self._reflection_suggestion = self._reflect(child, parents)
+
+    def _register_lineage_node(self, func, parents=None):
+        """Add a function to the persistent DAG before population survival."""
+        with self._lineage_lock:
+            node_id = self._next_lineage_id
+            self._next_lineage_id += 1
+            parent_ids = []
+            for parent in parents or []:
+                parent_id = getattr(parent, '_eoh_lineage_id', None)
+                if parent_id is not None:
+                    parent_ids.append(parent_id)
+            func._eoh_lineage_id = node_id
+            func._eoh_parent_ids = tuple(parent_ids)
+            record = {
+                'node_id': node_id,
+                'parent_ids': parent_ids,
+                'score': func.score,
+                'algorithm': getattr(func, 'algorithm', ''),
+                'suggestion': getattr(func, '_eoh_generation_suggestion', None),
+                'name': func.name,
+                'args': func.args,
+                'body': func.body,
+                'return_type': func.return_type,
+                'generation': self._population.generation,
+                'operator': getattr(func, 'operator', None),
+            }
+            self._append_lineage_record(record)
+
+    def _initialize_lineage_file(self):
+        path = os.path.dirname(self._lineage_log_path)
+        if path:
+            os.makedirs(path, exist_ok=True)
+        if not os.path.exists(self._lineage_log_path):
+            with open(self._lineage_log_path, 'w', encoding='utf-8') as file:
+                json.dump({'nodes': []}, file)
+        else:
+            try:
+                with open(self._lineage_log_path, encoding='utf-8') as file:
+                    data = json.load(file)
+                self._next_lineage_id = max(
+                    (int(node['node_id']) for node in data.get('nodes', [])), default=-1
+                ) + 1
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                raise ValueError(f'Invalid lineage JSON file: {self._lineage_log_path}')
+
+    def _append_lineage_record(self, record):
+        with open(self._lineage_log_path, encoding='utf-8') as file:
+            data = json.load(file)
+        data.setdefault('nodes', []).append(record)
+        directory = os.path.dirname(self._lineage_log_path) or '.'
+        fd, temp_path = tempfile.mkstemp(prefix='.eoh_lineage_', suffix='.tmp', dir=directory)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as file:
+                json.dump(data, file, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self._lineage_log_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def get_lineage_parents(self, func):
+        """Return parent Function objects even after population survival removes them."""
+        with self._lineage_lock:
+            with open(self._lineage_log_path, encoding='utf-8') as file:
+                records = {int(node['node_id']): node for node in json.load(file).get('nodes', [])}
+        parents = []
+        for parent_id in getattr(func, '_eoh_parent_ids', ()):
+            record = records.get(int(parent_id))
+            if record is None:
+                continue
+            parent = Function(
+                name=record['name'], args=record['args'], body=record['body'],
+                return_type=record.get('return_type'), score=record.get('score')
+            )
+            parent.algorithm = record.get('algorithm', '')
+            parent.operator = record.get('operator')
+            parent._eoh_generation_suggestion = record.get('suggestion')
+            parent._eoh_lineage_id = record['node_id']
+            parent._eoh_parent_ids = tuple(record.get('parent_ids', []))
+            parents.append(parent)
+        return parents
+
+    def _sample_evaluate_register(self, prompt, parents=None):
         """Perform following steps:
         1. Sample an algorithm using the given prompt.
         2. Evaluate it by submitting to the process/thread pool, and get the results.
         3. Add the function to the population and register it to the profiler.
         """
         sample_start = time.time()
+        generation_suggestion = self._reflection_suggestion if parents is not None else None
+        # After initialization, generation is driven only by reflection guidance
+        # and the fixed output/implementation requirements. The legacy operator
+        # prompts are retained only for initialization compatibility and labels.
+        if parents is not None:
+            prompt = f'''{self._reflection_suggestion or "Improve the current algorithm with a meaningful change."}
+{EoHPrompt.requirements()}
+Output the algorithm in the required thought/code format. Do not give additional explanations.'''
+        else:
+            prompt = prompt
         thought, func = self._sampler.get_thought_and_function(prompt)
         sample_time = time.time() - sample_start
         if thought is None or func is None:
-            return
+            return False
         # convert to Program instance
         program = TextFunctionProgramConverter.function_to_program(func, self._template_program)
         if program is None:
-            return
+            return False
         # evaluate
         score, eval_time = self._evaluation_executor.submit(
             self._evaluator.evaluate_program_record_time,
@@ -188,14 +317,19 @@ class EoH:
         func.evaluate_time = eval_time
         func.algorithm = thought
         func.sample_time = sample_time
+        func._eoh_generation_suggestion = generation_suggestion
+        self._tot_sample_nums += 1
         if self._profiler is not None:
             self._profiler.register_function(func, program=str(program))
             if isinstance(self._profiler, EoHProfiler):
                 self._profiler.register_population(self._population)
-            self._tot_sample_nums += 1
+        if score is None:
+            return False
+        self._register_lineage_node(func, parents)
 
         # register to the population
         self._population.register_function(func)
+        return score is not None
 
     def _continue_loop(self) -> bool:
         if self._max_generations is None and self._max_sample_nums is None:
@@ -210,52 +344,24 @@ class EoH:
 
     def _iteratively_use_eoh_operator(self):
         while self._continue_loop():
-            try:
-                # get a new func using e1
-                indivs = [self._population.selection() for _ in range(self._selection_num)]
-                prompt = EoHPrompt.get_prompt_e1(indivs, self._info)
-                if self._debug_mode:
-                    print(f'E1 Prompt: {prompt}')
-                self._sample_evaluate_register(prompt)
-                if not self._continue_loop():
-                    break
-
-                # get a new func using e2
-                if self._use_e2_operator:
-                    indivs = [self._population.selection() for _ in range(self._selection_num)]
-                    prompt = EoHPrompt.get_prompt_e2(indivs, self._info)
+            generated = 0
+            while generated < self._pop_size and self._continue_loop():
+                try:
+                    count = random.randint(1, min(3, len(self._population)))
+                    parents = random.sample(self._population.population, count)
+                    subject = max(parents, key=lambda item: item.score)
+                    self._reflection_suggestion = self._reflect(
+                        subject, [item for item in parents if item is not subject]
+                    )
+                    prompt = self._reflection_suggestion or 'Improve the selected algorithms.'
+                    if self._sample_evaluate_register(prompt, parents):
+                        generated += 1
+                except KeyboardInterrupt:
+                    return
+                except Exception:
                     if self._debug_mode:
-                        print(f'E2 Prompt: {prompt}')
-                    self._sample_evaluate_register(prompt)
-                    if not self._continue_loop():
-                        break
-
-                # get a new func using m1
-                if self._use_m1_operator:
-                    indiv = self._population.selection()
-                    prompt = EoHPrompt.get_prompt_m1(indiv, self._info)
-                    if self._debug_mode:
-                        print(f'M1 Prompt: {prompt}')
-                    self._sample_evaluate_register(prompt)
-                    if not self._continue_loop():
-                        break
-
-                # get a new func using m2
-                if self._use_m2_operator:
-                    indiv = self._population.selection()
-                    prompt = EoHPrompt.get_prompt_m2(indiv, self._info)
-                    if self._debug_mode:
-                        print(f'M2 Prompt: {prompt}')
-                    self._sample_evaluate_register(prompt)
-                    if not self._continue_loop():
-                        break
-            except KeyboardInterrupt:
-                break
-            except Exception as e:
-                if self._debug_mode:
-                    traceback.print_exc()
-                    exit()
-                continue
+                        traceback.print_exc()
+                    continue
 
         # shutdown evaluation_executor
         try:
@@ -312,7 +418,9 @@ class EoH:
                 return
 
         # evolutionary search
-        self._multi_threaded_sampling(self._iteratively_use_eoh_operator)
+        # Generations are built as exact pop_size batches; run this coordinator
+        # in one thread so survival happens only after each complete batch.
+        self._iteratively_use_eoh_operator()
 
         # finish
         if self._profiler is not None:

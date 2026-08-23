@@ -8,6 +8,41 @@ from ...base import *
 
 class EoHPrompt:
     @classmethod
+    def get_prompt_reflection(cls, child, parents=None, mode: int = 4, info: dict | None = None) -> str:
+        """Ask for one concise improvement suggestion for the next algorithm."""
+        task_prompt = info['task_description']
+        parents = parents or []
+        child_code = str(child)
+        child_thought = getattr(child, 'algorithm', '')
+        parent_code = '\n\n'.join(str(item) for item in parents)
+        parent_thought = '\n\n'.join(getattr(item, 'algorithm', '') for item in parents)
+        if mode == 1:
+            evidence = f'Child code:\n{child_code}'
+        elif mode == 2:
+            evidence = f'Child code:\n{child_code}\n\nChild thought:\n{child_thought}'
+        elif mode == 3:
+            evidence = f'Parent code(s):\n{parent_code}\n\nChild code:\n{child_code}'
+        elif mode == 4:
+            evidence = (f'Parent thought(s):\n{parent_thought}\n\nParent code(s):\n{parent_code}\n\n'
+                        f'Child thought:\n{child_thought}\n\nChild code:\n{child_code}')
+        else:
+            raise ValueError('reflection_input_mode must be one of 1, 2, 3, or 4.')
+        return f'''{task_prompt}
+Analyze the following algorithm design and provide one concrete improvement suggestion for the next code.
+{evidence}
+{cls.requirements()}
+Output only a concise suggestion for the next code. Do not output code, thought, or multiple alternatives.'''
+
+    @staticmethod
+    def append_reflection(prompt: str, suggestion: str | None, requirements: str) -> str:
+        if not suggestion:
+            return prompt
+        return f'''{prompt}
+Use the following reflection as guidance for this generation:
+{suggestion}
+{requirements}'''
+
+    @classmethod
     def create_instruct_prompt(cls, prompt: str) -> List[Dict]:
         content = [
             {'role': 'system', 'message': cls.get_system_prompt()},
