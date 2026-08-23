@@ -38,6 +38,7 @@ crossover:
 func_template = '''thought:{...}
 ```python
 Code:
+import numpy as np
 def <method_name>(self, <method_args>):
     ...
 ```

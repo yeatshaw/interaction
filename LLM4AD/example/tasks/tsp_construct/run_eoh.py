@@ -7,8 +7,8 @@ sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from llm4ad.task.optimization.tsp_construct import TSPEvaluation
 from llm4ad.tools.llm.llm_api_https import HttpsApi
-from llm4ad.tools.profiler import ProfilerBase
-from llm4ad.method.eoh import EoH
+from llm4ad.method.eoh import EoH, EoHProfiler
+from example.tasks.utils import get_info
 
 
 def main():
@@ -25,10 +25,14 @@ def main():
         timeout_seconds=600,
         dataset_path="/public/home/liuyang/dataset/tsp_instances.pkl"
     )
+    info = get_info(
+        'select_next_node',
+        'llm4ad.task.optimization.tsp_construct.template'
+    )
     reflection_mode = 1
 
     method = EoH(llm=llm,
-                 profiler=ProfilerBase(log_dir=str(log_dir), log_style='complex'),
+                 profiler=EoHProfiler(log_dir=str(log_dir), log_style='complex'),
                  evaluation=task,
                  max_sample_nums=1000,
                  max_generations=1000,
@@ -37,6 +41,7 @@ def main():
                  num_evaluators=10,
                  reflection_input_mode=reflection_mode,
                  lineage_log_path=lineage_path,
+                 info=info,
                  debug_mode=False)
     method.run()
 

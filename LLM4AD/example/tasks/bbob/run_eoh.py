@@ -9,7 +9,7 @@ from llm4ad.task.optimization.bbob.evaluation import BBOBEvaluationINI
 from llm4ad.tools.llm.llm_api_https import HttpsApi
 from llm4ad.tools.profiler import ProfilerBase
 from llm4ad.method.eoh import EoH, EoHProfiler
-from utils import get_info
+from example.tasks.utils import get_info
 
 
 def main():
@@ -18,7 +18,12 @@ def main():
                    model='xxx',  # your llm, e.g., 'gpt-3.5-turbo'
                    timeout=120)
     method_name = 'mutate'
-    info = get_info(method_name)
+    info = get_info(
+        method_name,
+        'llm4ad.task.optimization.bbob.template',
+        source_file=str(PROJECT_ROOT / 'llm4ad' / 'task' / 'optimization' / 'bbob' / 'lshade.py'),
+        class_name='LSHADE'
+    )
     task = BBOBEvaluationINI(method_name=method_name)
 
     method = EoH(llm=llm,
