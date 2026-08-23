@@ -189,6 +189,11 @@ class ProfilerBase:
                 print(f'{function_str}')
                 print(f'------------------------------------------------------')
                 print(f'Operator     : {operator}')
+                if hasattr(function, 'parent_score'):
+                    parent_score = function.parent_score
+                    print(f'Parent score : {"Root" if parent_score is None else parent_score}')
+                if hasattr(function, 'depth'):
+                    print(f'Depth        : {function.depth}')
                 print(f'Score        : {str(score)}')
                 print(f'Sample time  : {str(sample_time)}')
                 print(f'Evaluate time: {str(evaluate_time)}')

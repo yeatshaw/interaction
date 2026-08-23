@@ -205,6 +205,9 @@ class MCTS_AHD:
         func.evaluate_time = eval_time
         func.algorithm = thought
         func.sample_time = sample_time
+        func.operator = event.get('operator', 'unknown')
+        func.parent_score = event.get('parent_score')
+        func.depth = event.get('parent_depth', 0) + 1
         if self._profiler is not None:
             self._profiler.register_function(func, program=str(program))
             if isinstance(self._profiler, MAProfiler):
@@ -416,15 +419,6 @@ class MCTS_AHD:
             print(f"Timeout emerge, no expanding with action {option}.")
             return node_set
 
-        if option != 'e1':
-            print(
-                f"Action: {option}, Father Obj: {cur_node.raw_info.score}, Now Obj: {func.score}, Depth: {cur_node.depth + 1}")
-        else:
-            if self.check_duplicate_obj(node_set, func.score):
-                print(f"Duplicated e1, no action, Father is Root, Abandon Obj: {func.score}")
-            else:
-                print(f"Action: {option}, Father is Root, Now Obj: {func.score}")
-
         if is_valid_func and func.score != float('-inf'):
             self._population.register_function(func)
             now_node = MCTSNode(func.algorithm, str(func), -1 * func.score, individual=func,
@@ -530,9 +524,6 @@ class MCTS_AHD:
         while self._continue_loop():
             self._dynamics.start_round()
             node_set = []
-            print(f"Current performances of MCTS nodes: {mcts.rank_list}")
-            print(
-                f"Current number of MCTS nodes in the subtree of each child of the root: {[len(node.subtree) for node in mcts.root.children]}")
             cur_node = mcts.root
             while len(cur_node.children) > 0 and cur_node.depth < mcts.max_depth:
                 uct_scores = [mcts.uct(node, max(1 - self._tot_sample_nums / self._max_sample_nums, 0)) for node in
@@ -549,7 +540,6 @@ class MCTS_AHD:
                 cur_node = cur_node.children[selected_pair_idx]
             for i in range(len(n_op)):
                 op = n_op[i]
-                print(f"Iter: {self._tot_sample_nums}/{self._max_sample_nums} OP: {op}", end="|")
                 op_w = op_weights[i]
                 for j in range(op_w):
                     if not self._continue_loop():
