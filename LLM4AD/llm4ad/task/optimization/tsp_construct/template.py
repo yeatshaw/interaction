@@ -4,6 +4,11 @@ task_description = (
     "length. The algorithm selects one next node at each construction step."
 )
 
+method_signature = (
+    'current_node: int, destination_node: int, '
+    'unvisited_nodes: np.ndarray, distance_matrix: np.ndarray'
+)
+
 class_args = '''
 - current_node: int, ID of the node currently being visited.
 - destination_node: int, ID of the destination/start node.

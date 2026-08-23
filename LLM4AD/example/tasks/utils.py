@@ -42,10 +42,10 @@ def get_info(method_name: str, template_module: str, *, source_file: str | None 
         signature = _signature_from_source(
             Path(source_file).read_text(encoding='utf-8'), method_name, class_name
         )
-    elif hasattr(template, 'template_program'):
-        signature = _signature_from_source(template.template_program, method_name)
     else:
-        raise ValueError('Provide source_file when template_program is not defined.')
+        signature = getattr(template, 'method_signature', None)
+        if signature is None:
+            raise ValueError('Provide source_file or method_signature for this template.')
 
     template_program = getattr(
         template, 'template_program',
