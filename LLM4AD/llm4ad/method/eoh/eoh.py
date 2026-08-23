@@ -179,10 +179,10 @@ class EoH:
                 print(f'Warning: population size {self._pop_size} '
                       f'is not suitable, please reset it to 5.')
 
-    def _reflect(self, child, parents=None):
+    def _reflect(self, children, parents=None):
         """Generate a compact suggestion; reflection text is not registered as a child."""
         prompt = EoHPrompt.get_prompt_reflection(
-            child, parents, self._reflection_input_mode, self._info
+            children, parents, self._reflection_input_mode, self._info
         )
         try:
             suggestion = self._sampler.llm.draw_sample(prompt)
@@ -192,15 +192,11 @@ class EoH:
             return None
         return suggestion.strip() if isinstance(suggestion, str) else None
 
-    def _prepare_reflection(self):
+    def _prepare_reflection(self, refs):
         if not self._population.population:
             return
-        count = random.randint(1, min(3, len(self._population.population)))
-        refs = random.sample(self._population.population, count)
-        # Use the best selected reference as the child when no fresh child exists.
-        child = max(refs, key=lambda item: item.score)
-        parents = [item for item in refs if item is not child]
-        self._reflection_suggestion = self._reflect(child, parents)
+        lineage_parents = [self.get_lineage_parents(child) for child in refs]
+        self._reflection_suggestion = self._reflect(refs, lineage_parents)
 
     def _register_lineage_node(self, func, parents=None):
         """Add a function to the persistent DAG before population survival."""
@@ -349,10 +345,7 @@ Output the algorithm in the required thought/code format. Do not give additional
                 try:
                     count = random.randint(1, min(3, len(self._population)))
                     parents = random.sample(self._population.population, count)
-                    subject = max(parents, key=lambda item: item.score)
-                    self._reflection_suggestion = self._reflect(
-                        subject, [item for item in parents if item is not subject]
-                    )
+                    self._prepare_reflection(parents)
                     prompt = self._reflection_suggestion or 'Improve the selected algorithms.'
                     if self._sample_evaluate_register(prompt, parents):
                         generated += 1

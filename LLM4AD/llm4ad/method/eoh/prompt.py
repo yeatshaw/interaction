@@ -8,14 +8,21 @@ from ...base import *
 
 class EoHPrompt:
     @classmethod
-    def get_prompt_reflection(cls, child, parents=None, mode: int = 4, info: dict | None = None) -> str:
+    def get_prompt_reflection(cls, children, parents=None, mode: int = 4, info: dict | None = None) -> str:
         """Ask for one concise improvement suggestion for the next algorithm."""
         task_prompt = info['task_description']
-        parents = parents or []
-        child_code = str(child)
-        child_thought = getattr(child, 'algorithm', '')
-        parent_code = '\n\n'.join(str(item) for item in parents)
-        parent_thought = '\n\n'.join(getattr(item, 'algorithm', '') for item in parents)
+        children = children if isinstance(children, list) else [children]
+        parents = parents or [[] for _ in children]
+        child_code = '\n\n'.join(f'Candidate {i + 1}:\n{item}' for i, item in enumerate(children))
+        child_thought = '\n\n'.join(f'Candidate {i + 1}:\n{getattr(item, "algorithm", "")}' for i, item in enumerate(children))
+        parent_code = '\n\n'.join(
+            f'Candidate {i + 1} parent(s):\n' + '\n\n'.join(str(parent) for parent in group)
+            for i, group in enumerate(parents) if group
+        )
+        parent_thought = '\n\n'.join(
+            f'Candidate {i + 1} parent thought(s):\n' + '\n\n'.join(getattr(parent, 'algorithm', '') for parent in group)
+            for i, group in enumerate(parents) if group
+        )
         if mode == 1:
             evidence = f'Child code:\n{child_code}'
         elif mode == 2:
@@ -28,10 +35,10 @@ class EoHPrompt:
         else:
             raise ValueError('reflection_input_mode must be one of 1, 2, 3, or 4.')
         return f'''{task_prompt}
-Analyze the following algorithm design and provide one concrete improvement suggestion for the next code.
+Extract the key reason in the subject algorithm that should guide the next code change, and turn it into one concrete improvement suggestion.
 {evidence}
 {cls.requirements()}
-Output only a concise suggestion for the next code. Do not output code, thought, or multiple alternatives.'''
+Output only the concise improvement suggestion. Do not output the subject-selection reason, analysis, code, thought, or multiple alternatives.'''
 
     @staticmethod
     def append_reflection(prompt: str, suggestion: str | None, requirements: str) -> str:
