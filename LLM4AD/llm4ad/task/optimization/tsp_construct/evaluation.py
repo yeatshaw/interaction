@@ -44,16 +44,6 @@ from llm4ad.task.optimization.tsp_construct.template import task_description
 
 __all__ = ['TSPEvaluation']
 
-_TSP_TEMPLATE_PROGRAM = '''import numpy as np
-
-def select_next_node(current_node: int, destination_node: int,
-                     unvisited_nodes: np.ndarray,
-                     distance_matrix: np.ndarray) -> int:
-    """Select exactly one next node from unvisited_nodes."""
-    return unvisited_nodes[0]
-'''
-
-
 class TSPEvaluation(Evaluation):
     """Evaluator for traveling salesman problem."""
 
@@ -73,8 +63,6 @@ class TSPEvaluation(Evaluation):
         """
 
         super().__init__(
-            template_program=_TSP_TEMPLATE_PROGRAM,
-            task_description=task_description,
             use_numba_accelerate=False,
             timeout_seconds=timeout_seconds
         )

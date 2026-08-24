@@ -70,10 +70,12 @@ class Population:
 
     def has_duplicate_function(self, func: str | Function) -> bool:
         for f in self._population:
-            if str(f) == str(func) or func.score == f.score:
+            # Equal objective values do not imply duplicate algorithms.  On
+            # fixed benchmark instances, distinct implementations often tie.
+            if str(f) == str(func):
                 return True
         for f in self._next_gen_pop:
-            if str(f) == str(func) or func.score == f.score:
+            if str(f) == str(func):
                 return True
         return False
 

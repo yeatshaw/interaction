@@ -52,11 +52,33 @@ class EoHPrompt:
             raise ValueError('reflection_input_mode must be one of 1, 2, 3, or 4.')
         return f'''Task:{task_prompt}
 {evidence}
-Reflect requirement:
-1. Identify the most useful design insight from the provided algorithm(s).
-2. Just output one concrete improvement suggestion for the next code.
+Identify the most useful design insight from the provided algorithm(s). Then, output a specific improvement suggestion within {{}}, without outputting code or extra explanations.
 '''
-
+    @classmethod
+    def get_prompt_design(cls, info, indivs, suggestion):
+        method_name, method_args, func_template, class_args = cls._template_values(info)
+        task_prompt = info['task_description']
+        for indi in indivs:
+            assert hasattr(indi, 'algorithm')
+        # create prompt content for all individuals
+        indivs_prompt = ''
+        for i, indi in enumerate(indivs):
+            indi.docstring = ''
+            indivs_prompt += f'No. {i + 1} method and the corresponding code are:\n{indi.algorithm}\n{str(indi)}'
+        # create prmpt content
+        prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
+I have {len(indivs)} implementations of this method with their codes as follows:
+{indivs_prompt}
+{class_args}
+{method_args}
+This is the format for your reply:
+{func_template}
+Here is a suggestion to guide the design of a new algorithm:
+{suggestion}
+{cls.requirements()}
+Do not give additional explanations.'''
+        return prompt_content
+            
     @staticmethod
     def append_reflection(prompt: str, suggestion: str | None, requirements: str) -> str:
         if not suggestion:
