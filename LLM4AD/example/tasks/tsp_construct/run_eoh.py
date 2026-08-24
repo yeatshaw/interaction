@@ -13,7 +13,9 @@ from example.tasks.utils import get_info
 
 def main():
     log_dir = Path(os.environ.get('LLM4AD_LOG_DIR', 'logs/eoh_tsp'))
-    lineage_path = os.environ.get('LLM4AD_EOH_LINEAGE', str(log_dir / 'eoh_lineage.json'))
+    # EoH places the default lineage file in the profiler's timestamped run
+    # directory. An explicit path remains available for resume/debug runs.
+    lineage_path = os.environ.get('LLM4AD_EOH_LINEAGE', 'eoh_lineage.json')
     llm = HttpsApi(
         host='api.apilio.ai',
         key='',

@@ -118,15 +118,19 @@ class EoH:
 
         # population, sampler, and evaluator
         self._population = Population(pop_size=self._pop_size)
+        self._profiler = profiler
         # The lineage DAG is persisted on disk; population survival remains the
         # sole mechanism for evolution. Only the current population stays in RAM.
+        # When the caller leaves the default path, keep the DAG beside the
+        # profiler's timestamped run logs (e.g. logs/eoh_tsp/YYYYMMDD_HHMMSS).
+        if lineage_log_path == 'eoh_lineage.json' and profiler is not None:
+            lineage_log_path = os.path.join(profiler._log_dir, 'eoh_lineage.json')
         self._lineage_log_path = os.path.abspath(lineage_log_path)
         self._next_lineage_id = 0
         self._lineage_lock = Lock()
         self._initialize_lineage_file()
         self._sampler = EoHSampler(llm, self._template_program_str)
         self._evaluator = SecureEvaluator(evaluation, debug_mode=debug_mode, **kwargs)
-        self._profiler = profiler
 
         # statistics
         self._tot_sample_nums = 0
@@ -278,14 +282,14 @@ class EoH:
             parents.append(parent)
         return parents
 
-    def _sample_evaluate_register(self, prompt, parents=None):
+    def _sample_evaluate_register(self, prompt, parents=None, operator=None):
         """Perform following steps:
         1. Sample an algorithm using the given prompt.
         2. Evaluate it by submitting to the process/thread pool, and get the results.
         3. Add the function to the population and register it to the profiler.
         """
         sample_start = time.time()
-        generation_suggestion = self._reflection_suggestion if parents else None
+        generation_suggestion = self._reflection_suggestion if operator=='reflection' else None
         thought, func = self._sampler.get_thought_and_function(prompt)
         sample_time = time.time() - sample_start
         if thought is None or func is None:
@@ -304,6 +308,7 @@ class EoH:
         func.evaluate_time = eval_time
         func.algorithm = thought
         func.sample_time = sample_time
+        func.operator = operator
         func._eoh_generation_suggestion = generation_suggestion
         self._tot_sample_nums += 1
         if self._profiler is not None:
@@ -316,7 +321,6 @@ class EoH:
 
         # register to the population
         self._population.register_function(func)
-        return score is not None
 
     def _continue_loop(self) -> bool:
         if self._max_generations is None and self._max_sample_nums is None:
@@ -337,7 +341,7 @@ class EoH:
                 prompt = EoHPrompt.get_prompt_e1(indivs, self._info)
                 if self._debug_mode:
                     print(f'E1 Prompt: {prompt}')
-                self._sample_evaluate_register(prompt, indivs)
+                self._sample_evaluate_register(prompt, indivs, operator='e1')
                 if not self._continue_loop():
                     break
                 
@@ -348,7 +352,7 @@ class EoH:
                 prompt = EoHPrompt.get_prompt_design(self._info, parents, self._reflection_suggestion)
                 if self._debug_mode:
                     print(f'RE Prompt: {prompt}')
-                self._sample_evaluate_register(prompt, parents)
+                self._sample_evaluate_register(prompt, parents, operator='reflection')
                 if not self._continue_loop():
                     break
                 
@@ -358,7 +362,7 @@ class EoH:
                     prompt = EoHPrompt.get_prompt_e2(indivs, self._info)
                     if self._debug_mode:
                         print(f'E2 Prompt: {prompt}')
-                    self._sample_evaluate_register(prompt, indivs)
+                    self._sample_evaluate_register(prompt, indivs, operator='e2')
                     if not self._continue_loop():
                         break
 
@@ -368,7 +372,7 @@ class EoH:
                     prompt = EoHPrompt.get_prompt_m1(indiv, self._info)
                     if self._debug_mode:
                         print(f'M1 Prompt: {prompt}')
-                    self._sample_evaluate_register(prompt, [indiv])
+                    self._sample_evaluate_register(prompt, [indiv], operator='m1')
                     if not self._continue_loop():
                         break
 
@@ -378,7 +382,7 @@ class EoH:
                     prompt = EoHPrompt.get_prompt_m2(indiv, self._info)
                     if self._debug_mode:
                         print(f'M2 Prompt: {prompt}')
-                    self._sample_evaluate_register(prompt, [indiv])
+                    self._sample_evaluate_register(prompt, [indiv], operator='m2')
                     if not self._continue_loop():
                         break
             except KeyboardInterrupt:
@@ -402,7 +406,7 @@ class EoH:
             try:
                 # get a new func using i1
                 prompt = EoHPrompt.get_prompt_i1(self._info)
-                self._sample_evaluate_register(prompt)
+                self._sample_evaluate_register(prompt, operator='i1')
                 if self._tot_sample_nums >= self._initial_sample_nums_max:
                     # print(f'Warning: Initialization not accomplished in {self._initial_sample_nums_max} samples !!!')
                     print(
