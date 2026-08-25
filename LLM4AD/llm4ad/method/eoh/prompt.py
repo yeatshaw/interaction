@@ -247,7 +247,7 @@ Do not give additional explanations.'''
         return prompt_content
 
     @classmethod
-    def get_prompt_e1(cls, indivs: List[Function], info: dict | None = None):
+    def get_prompt_e1(cls, indivs: List[Function], info: dict | None = None, suggestion: str | None = None):
         method_name, method_args, func_template, class_args = cls._template_values(info)
         task_prompt = info['task_description']
         for indi in indivs:
@@ -265,13 +265,16 @@ I have {len(indivs)} implementations of this method with their codes as follows:
 {method_args}
 This is the format for your reply:
 {func_template}
-Please help me create a new algorithm that has a totally different form from the given ones. 
+These are some suggestions after reflecting on the given algorithms:
+{suggestion}
+Please refer to the given suggestions and help me create a new algorithm that has a totally different form from the given ones. 
 {cls.requirements()}
 Do not give additional explanations.'''
         return prompt_content
 
     @classmethod
-    def get_prompt_e2(cls, indivs: List[Function], info: dict | None = None):
+    def get_prompt_e2(cls, indivs: List[Function], info: dict | None = None,
+                      suggestion: str | None = None):
         method_name, method_args, func_template, class_args = cls._template_values(info)
         task_prompt = info['task_description']
         for indi in indivs:
@@ -290,13 +293,16 @@ I have {len(indivs)} implementations of this method with their codes as follows:
 {method_args}
 This is the format for your reply:
 {func_template}
-Please identify the common backbone idea in the provided methods and help me create a new algorithm that has a totally different form from the given ones but can be motivated from them.
+These are some suggestions after reflecting on the given algorithms:
+{suggestion}
+Please refer to the given suggestions and identify the common backbone idea in the provided methods and help me create a new algorithm that has a totally different form from the given ones but can be motivated from them.
 {cls.requirements()}
 Do not give additional explanations.'''
         return prompt_content
 
     @classmethod
-    def get_prompt_m1(cls, indi: Function, info: dict | None = None):
+    def get_prompt_m1(cls, indi: Function, info: dict | None = None,
+                      suggestion: str | None = None):
         method_name, method_args, func_template, class_args = cls._template_values(info)
         task_prompt = info['task_description']
         assert hasattr(indi, 'algorithm')
@@ -310,13 +316,16 @@ I have a implementation of this method with its code as follows:
 {method_args}
 This is the format for your reply:
 {func_template}
-Please assist me in creating a new algorithm that has a different form but can be a modified version of the algorithm provided.
+These are some suggestions after reflecting on the given algorithms:
+{suggestion}
+Please refer to the given suggestions and assist me in creating a new algorithm that has a different form but can be a modified version of the algorithm provided.
 {cls.requirements()}
 Do not give additional explanations.'''
         return prompt_content
 
     @classmethod
-    def get_prompt_m2(cls, indi: Function, info: dict | None = None):
+    def get_prompt_m2(cls, indi: Function, info: dict | None = None,
+                      suggestion: str | None = None):
         method_name, method_args, func_template, class_args = cls._template_values(info)
         task_prompt = info['task_description']
         assert hasattr(indi, 'algorithm')
@@ -329,7 +338,9 @@ I have a implementation of this method with its code as follows:
 {method_args}
 This is the format for your reply:
 {func_template}
-Please identify the main algorithm parameters and assist me in creating a new algorithm that has a different parameter settings of the score function provided.
+These are some suggestions after reflecting on the given algorithms:
+{suggestion}
+Please refer to the given suggestions and identify the main algorithm parameters and assist me in creating a new algorithm that has a different parameter settings of the score function provided.
 {cls._requirements()}
 Do not give additional explanations.'''
         return prompt_content

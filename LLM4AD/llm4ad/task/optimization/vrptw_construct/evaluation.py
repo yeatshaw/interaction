@@ -34,14 +34,13 @@
 from __future__ import annotations
 
 from typing import Any
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
 import copy
 import os
 import pickle
 import numpy as np
 from llm4ad.base import Evaluation
 from llm4ad.task.optimization.vrptw_construct.get_instance import GetData
-from llm4ad.task.optimization.vrptw_construct.template import task_description
 
 
 class VRPTWEvaluation(Evaluation):
@@ -101,9 +100,14 @@ class VRPTWEvaluation(Evaluation):
         return cost
 
     def evaluate_program(self, program_str: str, callable_func: callable) -> Any | None:
-        return self.evaluate(callable_func)
+        return self.evaluate(str(program_str))
 
-    def _evaluate_instance(self, heuristic, data):
+    def _evaluate_instance(self, function_source, data):
+            namespace = {}
+            exec(function_source, namespace)
+            heuristic = namespace.get('select_next_node')
+            if not callable(heuristic):
+                raise ValueError('Program does not define callable select_next_node.')
             _, distance_matrix, demands, vehicle_capacity, time_service, time_windows = data
             route = []
             current_load = 0
@@ -113,8 +117,6 @@ class VRPTWEvaluation(Evaluation):
             unvisited_nodes = set(range(1, self.problem_size + 1))  # Assuming node 0 is the depot
             all_nodes = np.array(list(unvisited_nodes))
             feasible_unvisited_nodes = all_nodes
-
-            unvisited_nodes_depot = np.array(list(unvisited_nodes))
 
             while unvisited_nodes:
 
@@ -131,7 +133,6 @@ class VRPTWEvaluation(Evaluation):
                     current_load = 0
                     current_time = 0
                     current_node = 0
-                    unvisited_nodes_depot = np.array(list(unvisited_nodes))
                 else:
                     travel_time = distance_matrix[current_node, next_node]
                     current_time += (travel_time)
@@ -147,7 +148,6 @@ class VRPTWEvaluation(Evaluation):
                     current_load += demands[next_node]
                     unvisited_nodes.remove(next_node)
                     current_node = next_node
-                    unvisited_nodes_depot = np.append(np.array(list(unvisited_nodes)), 0)
 
                 feasible_nodes_tw = np.array([node for node in all_nodes \
                                               if max(current_time + distance_matrix[current_node][node], time_windows[node][0]) < time_windows[node][1] - 0.0001 \
@@ -170,13 +170,20 @@ class VRPTWEvaluation(Evaluation):
 
             return self.tour_cost(distance_matrix, route, time_service, time_windows)
 
-    def evaluate(self, heuristic):
+    def evaluate(self, program_source):
         datasets = self._datasets[:self.n_instance]
         workers = min(self.instance_workers, len(datasets))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            distances = list(executor.map(
-                lambda data: self._evaluate_instance(heuristic, data), datasets
-            ))
+        try:
+            with mp.Pool(processes=workers) as pool:
+                distances = pool.starmap(
+                    self._evaluate_instance,
+                    [(program_source, data) for data in datasets]
+                )
+        except Exception as exc:
+            # Keep evaluation correct if a worker cannot be started or the
+            # evaluator instance cannot be serialized.
+            print(f'VRPTW instance parallel evaluation failed; falling back to serial: {exc}')
+            distances = [self._evaluate_instance(program_source, data) for data in datasets]
         if any(distance is None for distance in distances):
             return None
         return -float(np.average(distances))

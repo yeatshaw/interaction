@@ -201,6 +201,7 @@ class EoH:
             check_reflection_flag=self._reflection_check_guidance,
             population=self._population
         )
+        print(f'\nReflection Prompt: {prompt}\n')
         try:
             suggestion = self._sampler.llm.draw_sample(prompt)
         except Exception:
@@ -302,7 +303,7 @@ class EoH:
         3. Add the function to the population and register it to the profiler.
         """
         sample_start = time.time()
-        generation_suggestion = self._reflection_suggestion if operator=='reflection' else None
+        generation_suggestion = self._reflection_suggestion if operator != 'i1' else None
         thought, func = self._sampler.get_thought_and_function(prompt)
         sample_time = time.time() - sample_start
         if thought is None or func is None:
@@ -351,28 +352,20 @@ class EoH:
             try:
                 # get a new func using e1
                 indivs = [self._population.selection() for _ in range(self._selection_num)]
-                prompt = EoHPrompt.get_prompt_e1(indivs, self._info)
+                # 对indivs进行反思得到建议
+                self._prepare_reflection(indivs)
+                prompt = EoHPrompt.get_prompt_e1(indivs, self._info, self._reflection_suggestion)
                 if self._debug_mode:
                     print(f'E1 Prompt: {prompt}')
                 self._sample_evaluate_register(prompt, indivs, operator='e1')
                 if not self._continue_loop():
                     break
                 
-                # get a new func using reflection
-                count = random.randint(1, min(3, len(self._population)))
-                parents = random.sample(self._population.population, count)
-                self._prepare_reflection(parents)
-                prompt = EoHPrompt.get_prompt_design(self._info, parents, self._reflection_suggestion)
-                if self._debug_mode:
-                    print(f'RE Prompt: {prompt}')
-                self._sample_evaluate_register(prompt, parents, operator='reflection')
-                if not self._continue_loop():
-                    break
-                
                 # get a new func using e2
                 if self._use_e2_operator:
                     indivs = [self._population.selection() for _ in range(self._selection_num)]
-                    prompt = EoHPrompt.get_prompt_e2(indivs, self._info)
+                    self._prepare_reflection(indivs)
+                    prompt = EoHPrompt.get_prompt_e2(indivs, self._info, self._reflection_suggestion)
                     if self._debug_mode:
                         print(f'E2 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt, indivs, operator='e2')
@@ -382,7 +375,8 @@ class EoH:
                 # get a new func using m1
                 if self._use_m1_operator:
                     indiv = self._population.selection()
-                    prompt = EoHPrompt.get_prompt_m1(indiv, self._info)
+                    self._prepare_reflection([indiv])
+                    prompt = EoHPrompt.get_prompt_m1(indiv, self._info, self._reflection_suggestion)
                     if self._debug_mode:
                         print(f'M1 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt, [indiv], operator='m1')
@@ -392,7 +386,8 @@ class EoH:
                 # get a new func using m2
                 if self._use_m2_operator:
                     indiv = self._population.selection()
-                    prompt = EoHPrompt.get_prompt_m2(indiv, self._info)
+                    self._prepare_reflection([indiv])
+                    prompt = EoHPrompt.get_prompt_m2(indiv, self._info, self._reflection_suggestion)
                     if self._debug_mode:
                         print(f'M2 Prompt: {prompt}')
                     self._sample_evaluate_register(prompt, [indiv], operator='m2')
