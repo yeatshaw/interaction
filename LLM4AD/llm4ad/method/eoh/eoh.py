@@ -66,7 +66,7 @@ class EoH:
                  reflection_best_worst: bool = False,
                  reflection_fitness: int | None = None,
                  reflection_avg_fitness: bool = False,
-                 reflection_check_guidance: bool = False,
+                 reflection_check_guidance: bool = True,
                  lineage_log_path: str = 'eoh_lineage.json',
                  multi_thread_or_process_eval: Literal['thread', 'process'] = 'thread',
                  **kwargs):
@@ -115,6 +115,7 @@ class EoH:
         self._reflection_avg_fitness = reflection_avg_fitness
         self._reflection_check_guidance = reflection_check_guidance
         self._reflection_suggestion = None
+        self._reflection_experience = None
         llm.debug_mode = debug_mode
         self._multi_thread_or_process_eval = multi_thread_or_process_eval
         # function to be evolved
@@ -214,11 +215,47 @@ class EoH:
             return None
         return suggestion.strip() if isinstance(suggestion, str) else None
 
+    def _reflect_experience(self, refs):
+        """Summarize reusable experience from suggestions and prior experiences."""
+        paths = []
+        for ref in refs:
+            suggestion = getattr(ref, '_eoh_generation_suggestion', None)
+            experience = getattr(ref, '_eoh_experience', None)
+            if suggestion or experience:
+                paths.append((suggestion, experience))
+        if not paths:
+            return None
+        sections = []
+        for index, (suggestion, experience) in enumerate(paths, 1):
+            label = ('## Evolution path ##' if len(paths) == 1
+                     else f'## Evolution path {index} ##')
+            sections.append(
+                f'{label}\n'
+                f'The experience gained from evolving algorithms along this path is {experience or "None"}.\n'
+                f'The most recent design algorithm guidance for this evolution path is {suggestion or "None"}.'
+            )
+        prompt = (f"Task Description: {self._info['task_description']}\n"
+                  + '\n'.join(sections) + '\n\n'
+                  'Based on the above, sum up some experiences that align with evolutionary trends.')
+        try:
+            result = self._sampler.llm.draw_sample(prompt)
+        except Exception:
+            if self._debug_mode:
+                traceback.print_exc()
+            return None
+        return result.strip() if isinstance(result, str) else None
+
     def _prepare_reflection(self, refs):
         if not self._population.population:
             return
         lineage_parents = [self.get_lineage_parents(child) for child in refs]
         self._reflection_suggestion = self._reflect(refs, lineage_parents)
+        # Long-term reflection is only possible when at least one reference
+        # has a parent and therefore carries prior reflective information.
+        if any(getattr(ref, '_eoh_parent_ids', ()) for ref in refs):
+            self._reflection_experience = self._reflect_experience(refs)
+        else:
+            self._reflection_experience = None
 
     def _register_lineage_node(self, func, parents=None):
         """Add a function to the persistent DAG before population survival."""
@@ -238,6 +275,7 @@ class EoH:
                 'score': func.score,
                 'algorithm': getattr(func, 'algorithm', ''),
                 'suggestion': getattr(func, '_eoh_generation_suggestion', None),
+                'experience': getattr(func, '_eoh_experience', None),
                 'name': func.name,
                 'args': func.args,
                 'body': func.body,
@@ -325,6 +363,7 @@ class EoH:
             parent.algorithm = record.get('algorithm', '')
             parent.operator = record.get('operator')
             parent._eoh_generation_suggestion = record.get('suggestion')
+            parent._eoh_experience = record.get('experience')
             parent._eoh_lineage_id = record['node_id']
             parent._eoh_parent_ids = tuple(record.get('parent_ids', []))
             parents.append(parent)
@@ -358,6 +397,7 @@ class EoH:
         func.sample_time = sample_time
         func.operator = operator
         func._eoh_generation_suggestion = generation_suggestion
+        func._eoh_experience = self._reflection_experience if operator != 'i1' else None
         self._tot_sample_nums += 1
         if self._profiler is not None:
             self._profiler.register_function(func, program=str(program))

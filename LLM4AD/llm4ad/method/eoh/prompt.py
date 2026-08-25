@@ -66,6 +66,9 @@ class EoHPrompt:
                 guide = getattr(func, '_eoh_generation_suggestion', None)
                 if guide:
                     text += f'This algorithm is generated after being guided by {guide}\n'
+                experience = getattr(func, '_eoh_experience', None)
+                if experience:
+                    text += f'This path evolved into the algorithm, and the summarized experience is {experience}.\n'
             if hasattr(func, 'to_code_without_docstring'):
                 source = func.to_code_without_docstring().rstrip()
             else:
@@ -96,7 +99,7 @@ class EoHPrompt:
                     parent_label = ('# Reference Algorithm #' if len(group) == 1
                                     else f'# Reference Algorithm {j} #')
                     section.append(parent_label)
-                    section.append(block(parent))
+                    section.append(block(parent, include_guidance=True))
                 section.append('# Generated Algorithm #')
                 section.append(block(child, include_guidance=True))
             else:
@@ -110,9 +113,9 @@ class EoHPrompt:
             sections.append('===== best vs. worst =====\n'
                             'Here are the best and worst algorithms in the current population\n'
                             '## Best Algorithm ##\n' +
-                            block(ranked[0]) + '\n' +
+                            block(ranked[0], include_guidance=True) + '\n' +
                             '## Worst Algorithm ##\n' +
-                            block(ranked[-1]))
+                            block(ranked[-1], include_guidance=True))
         if avg_fitness_flag and population_items:
             scores = [f.score for f in population_items if f.score is not None]
             if scores:

@@ -250,4 +250,24 @@ Here are the reference algorithm sets from the previous algorithm design and the
 ...
 """
 
+#即时反思
+"""
+# Generated Algorithm #或者## Algorithm n ##
+thought: {...}
+This algorithm is generated after being guided by {suggestion}.
+This path evolved into the algorithm, and the summarized experience is {experience}.
+Code:
+"""
 
+#长期反思
+"""
+Task Description: {task_description}
+## Evolution path 1 ##
+The experience gained from evolving algorithms along this path is {experience 1}.
+The most recent design algorithm guidance for this evolution path is {suggestion 1}.
+## Evolution path n ##
+The experience gained from evolving algorithms along this path is {experience n}.
+The most recent design algorithm guidance for this evolution path is {suggestion n}.
+
+Based on the above, sum up some experiences that align with evolutionary trends.
+"""
