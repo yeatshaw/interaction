@@ -133,7 +133,9 @@ class EoH:
         if lineage_log_path == 'eoh_lineage.json' and profiler is not None:
             lineage_log_path = os.path.join(profiler._log_dir, 'eoh_lineage.json')
         self._lineage_log_path = os.path.abspath(lineage_log_path)
-        self._next_lineage_id = 0
+        self._lineage_base = os.path.splitext(self._lineage_log_path)[0]
+        self._lineage_shard_size = 100
+        self._next_lineage_id = 1
         self._lineage_lock = Lock()
         self._initialize_lineage_file()
         self._sampler = EoHSampler(llm, self._template_program_str)
@@ -141,6 +143,8 @@ class EoH:
 
         # statistics
         self._tot_sample_nums = 0
+        self._convergence_history = []
+        self._best_score_so_far = float('-inf')
 
         # reset _initial_sample_nums_max
         self._initial_sample_nums_max = min(
@@ -247,38 +251,68 @@ class EoH:
         path = os.path.dirname(self._lineage_log_path)
         if path:
             os.makedirs(path, exist_ok=True)
-        if not os.path.exists(self._lineage_log_path):
-            with open(self._lineage_log_path, 'w', encoding='utf-8') as file:
-                json.dump({'nodes': []}, file)
-        else:
-            try:
-                with open(self._lineage_log_path, encoding='utf-8') as file:
-                    data = json.load(file)
-                self._next_lineage_id = max(
-                    (int(node['node_id']) for node in data.get('nodes', [])), default=-1
-                ) + 1
-            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-                raise ValueError(f'Invalid lineage JSON file: {self._lineage_log_path}')
+        shard_files = self._lineage_shard_files()
+        if not shard_files:
+            self._write_lineage_shard(1, [])
+            return
+        # Only the newest shard is needed to continue numbering; parent lookup
+        # later opens just the shard containing each requested parent ID.
+        filename = max(shard_files, key=lambda item: int(
+            os.path.basename(item).rsplit('_', 1)[1].split('~', 1)[0]))
+        try:
+            with open(filename, encoding='utf-8') as file:
+                nodes = json.load(file).get('nodes', [])
+            max_id = max((int(node['node_id']) for node in nodes), default=0)
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f'Invalid lineage JSON file: {filename}') from exc
+        self._next_lineage_id = max_id + 1
 
-    def _append_lineage_record(self, record):
-        with open(self._lineage_log_path, encoding='utf-8') as file:
-            data = json.load(file)
-        data.setdefault('nodes', []).append(record)
+    def _lineage_shard_path(self, node_id):
+        start = ((int(node_id) - 1) // self._lineage_shard_size) * self._lineage_shard_size + 1
+        end = start + self._lineage_shard_size - 1
+        return f'{self._lineage_base}_{start}~{end}.json'
+
+    def _lineage_shard_files(self):
         directory = os.path.dirname(self._lineage_log_path) or '.'
+        prefix = os.path.basename(self._lineage_base) + '_'
+        return [os.path.join(directory, name) for name in os.listdir(directory)
+                if name.startswith(prefix) and name.endswith('.json')]
+
+    def _write_lineage_shard(self, node_id, nodes):
+        path = self._lineage_shard_path(node_id)
+        directory = os.path.dirname(path) or '.'
         fd, temp_path = tempfile.mkstemp(prefix='.eoh_lineage_', suffix='.tmp', dir=directory)
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as file:
-                json.dump(data, file, ensure_ascii=False, indent=2)
-            os.replace(temp_path, self._lineage_log_path)
+                json.dump({'nodes': nodes}, file, ensure_ascii=False, indent=2)
+            os.replace(temp_path, path)
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
+    def _append_lineage_record(self, record):
+        path = self._lineage_shard_path(record['node_id'])
+        try:
+            with open(path, encoding='utf-8') as file:
+                data = json.load(file)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {'nodes': []}
+        data.setdefault('nodes', []).append(record)
+        self._write_lineage_shard(record['node_id'], data['nodes'])
+
     def get_lineage_parents(self, func):
         """Return parent Function objects even after population survival removes them."""
         with self._lineage_lock:
-            with open(self._lineage_log_path, encoding='utf-8') as file:
-                records = {int(node['node_id']): node for node in json.load(file).get('nodes', [])}
+            records = {}
+            for parent_id in getattr(func, '_eoh_parent_ids', ()):
+                path = self._lineage_shard_path(parent_id)
+                try:
+                    with open(path, encoding='utf-8') as file:
+                        records[int(parent_id)] = next(
+                            (node for node in json.load(file).get('nodes', [])
+                             if int(node['node_id']) == int(parent_id)), None)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    continue
         parents = []
         for parent_id in getattr(func, '_eoh_parent_ids', ()):
             record = records.get(int(parent_id))
@@ -331,6 +365,11 @@ class EoH:
                 self._profiler.register_population(self._population)
         if score is None:
             return False
+        if self._max_sample_nums is None or len(self._convergence_history) < self._max_sample_nums:
+            self._best_score_so_far = max(self._best_score_so_far, score)
+            self._convergence_history.append(
+                (self._tot_sample_nums, self._best_score_so_far)
+            )
         self._register_lineage_node(func, parents)
 
         # register to the population

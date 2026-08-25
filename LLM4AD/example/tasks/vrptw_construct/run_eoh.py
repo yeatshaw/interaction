@@ -13,29 +13,10 @@ from llm4ad.method.eoh import EoH, EoHProfiler
 from example.tasks.utils import get_info
 
 
-def save_convergence_plot(log_dir):
-    samples_dir = Path(log_dir) / 'samples'
-    records = []
-    for path in sorted(samples_dir.glob('samples_*.json')):
-        if path.name == 'samples_best.json':
-            continue
-        try:
-            data = json.loads(path.read_text(encoding='utf-8'))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(data, list):
-            records.extend(item for item in data if isinstance(item, dict))
-    records = [r for r in records if r.get('sample_order') is not None
-               and isinstance(r.get('score'), (int, float))]
-    records.sort(key=lambda r: r['sample_order'])
-    if not records:
+def save_convergence_plot(log_dir, convergence_history):
+    if not convergence_history:
         return
-    sample_ids = [r['sample_order'] for r in records]
-    best_scores = []
-    best = float('-inf')
-    for record in records:
-        best = max(best, record['score'])
-        best_scores.append(best)
+    sample_ids, best_scores = zip(*convergence_history)
     output = Path(log_dir) / 'convergence.png'
     plt.figure(figsize=(8, 5))
     plt.plot(sample_ids, best_scores, linewidth=1.8)
@@ -95,7 +76,7 @@ def main():
                             debug_mode=False
                         )
                 method.run()
-                save_convergence_plot(method._profiler._log_dir)
+                save_convergence_plot(method._profiler._log_dir, method._convergence_history)
 
 
 if __name__ == '__main__':
