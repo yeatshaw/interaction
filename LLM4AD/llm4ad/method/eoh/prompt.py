@@ -154,7 +154,38 @@ Here is a suggestion to guide the design of a new algorithm:
 {cls.requirements()}
 Do not give additional explanations.'''
         return prompt_content
-            
+
+    @classmethod
+    def get_prompt_experience(cls, info, references):
+        """Build the long-term reflection prompt from reference histories."""
+        paths = []
+        for ref in references:
+            suggestion = getattr(ref, '_eoh_generation_suggestion', None)
+            experience = getattr(ref, '_eoh_experience', None)
+            if suggestion or experience:
+                paths.append((suggestion, experience))
+        if not paths:
+            return None
+        sections = []
+        for index, (suggestion, experience) in enumerate(paths, 1):
+            label = ('## Evolution path ##' if len(paths) == 1
+                     else f'## Evolution path {index} ##')
+            lines = [label]
+            if experience:
+                lines.append(
+                    'The experience gained from evolving algorithms along this path '
+                    f'is {experience}.'
+                )
+            if suggestion:
+                lines.append(
+                    'The most recent design algorithm guidance for this evolution path '
+                    f'is {suggestion}.'
+                )
+            sections.append('\n'.join(lines))
+        return (f"Task Description: {info['task_description']}\n"
+                + '\n'.join(sections) + '\n\n'
+                'Based on the above, sum up some experiences that align with evolutionary trends.')
+
     @staticmethod
     def append_reflection(prompt: str, suggestion: str | None, requirements: str) -> str:
         if not suggestion:

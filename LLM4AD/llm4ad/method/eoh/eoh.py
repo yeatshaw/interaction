@@ -217,26 +217,10 @@ class EoH:
 
     def _reflect_experience(self, refs):
         """Summarize reusable experience from suggestions and prior experiences."""
-        paths = []
-        for ref in refs:
-            suggestion = getattr(ref, '_eoh_generation_suggestion', None)
-            experience = getattr(ref, '_eoh_experience', None)
-            if suggestion or experience:
-                paths.append((suggestion, experience))
-        if not paths:
+        prompt = EoHPrompt.get_prompt_experience(self._info, refs)
+        print(f'\nExperience Prompt: {prompt}\n')
+        if not prompt:
             return None
-        sections = []
-        for index, (suggestion, experience) in enumerate(paths, 1):
-            label = ('## Evolution path ##' if len(paths) == 1
-                     else f'## Evolution path {index} ##')
-            sections.append(
-                f'{label}\n'
-                f'The experience gained from evolving algorithms along this path is {experience or "None"}.\n'
-                f'The most recent design algorithm guidance for this evolution path is {suggestion or "None"}.'
-            )
-        prompt = (f"Task Description: {self._info['task_description']}\n"
-                  + '\n'.join(sections) + '\n\n'
-                  'Based on the above, sum up some experiences that align with evolutionary trends.')
         try:
             result = self._sampler.llm.draw_sample(prompt)
         except Exception:
