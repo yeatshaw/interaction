@@ -8,7 +8,111 @@ from ...base import *
 
 class EoHPrompt:
     @classmethod
-    def get_prompt_reflection(cls, children, parents=None, mode: int = 4, info: dict | None = None) -> str:
+    def get_prompt_reflection(cls, children, parents=None, info=None,
+                              parent_info_flag=False, best_worst_flag=False,
+                              fitness_flag=0, avg_fitness_flag=False,
+                              check_reflection_flag=False, population=None) -> str:
+        """Build a reflection prompt for the input ablation study.
+
+        Defaults are the baseline: selected child code only. ``fitness_flag``
+        is 0 (code), 1 (code + thought), or 2 (code + thought + score).
+        """
+        if info is None:
+            raise ValueError('info is required for reflection prompts.')
+        children = children if isinstance(children, list) else [children]
+        parent_groups = parents or [[] for _ in children]
+        if len(parent_groups) != len(children):
+            raise ValueError('parents must contain one parent group per child.')
+        if fitness_flag not in (0, 1, 2):
+            raise ValueError('fitness_flag must be 0, 1, or 2.')
+
+        # Parent-aware reflection uses the evolution-path template only when
+        # at least one selected algorithm has a recorded parent. Algorithms
+        # without parents are omitted from that mixed input, as required by
+        # the ablation design.
+        has_parent = parent_info_flag and any(parent_groups)
+        if has_parent:
+            selected = [(child, group) for child, group in zip(children, parent_groups)
+                        if group]
+            children = [child for child, _ in selected]
+            parent_groups = [group for _, group in selected]
+        else:
+            parent_groups = [[] for _ in children]
+
+        def display_score(func):
+            score = getattr(func, 'score', None)
+            if score is None:
+                return None
+            # EoH maximizes negative cost internally. Reflection exposes the
+            # equivalent positive cost so that lower values are better.
+            return -score
+
+        def node_label(func, fallback):
+            node_id = getattr(func, '_eoh_lineage_id', None)
+            return f'Algorithm {node_id}' if node_id is not None else fallback
+
+        def block(func, label, include_score=True, include_guidance=False):
+            text = f'{label}\n'
+            if fitness_flag >= 1:
+                text += f'thought: {getattr(func, "algorithm", "")}\n'
+            if fitness_flag >= 2 and include_score:
+                text += f'score: {display_score(func)}\n'
+            if include_guidance and check_reflection_flag:
+                guide = getattr(func, '_eoh_generation_suggestion', None)
+                if guide:
+                    text += f'This algorithm is generated after being guided by {guide}\n'
+            text += f'Code:\n```python\n{str(func).rstrip()}\n```'
+            return text
+
+        sections = []
+        if has_parent:
+            sections.append(
+                '===== parent vs. child =====\n'
+                'Here are the reference algorithm sets from the previous algorithm design '
+                'and the new algorithms generated from them to complete the above task.'
+            )
+        else:
+            sections.append(
+                '===== reference =====\n'
+                'Here are a few pieces of algorithm to complete the above task.'
+            )
+        for i, child in enumerate(children, 1):
+            child_label = f'Algorithm {i}'
+            section = [f'## {child_label} ##',
+                       block(child, 'Code', include_guidance=True)]
+            if has_parent:
+                group = parent_groups[i - 1]
+                if group:
+                    section.append('# Reference Algorithm #')
+                    for j, parent in enumerate(group, 1):
+                        section.append('# Reference Algorithm #')
+                        section.append(block(parent, 'Code'))
+            sections.append('\n'.join(section))
+
+        population_items = list(getattr(population, 'population', population or []))
+        if best_worst_flag and population_items:
+            ranked = sorted(population_items, key=display_score)
+            sections.append('===== best vs. worst =====\n'
+                            'Here are the best and worst algorithms in the current population\n'
+                            '## Best Algorithm ##\n' +
+                            block(ranked[0], 'Code') + '\n' +
+                            '## Worst Algorithm ##\n' +
+                            block(ranked[-1], 'Code'))
+        if avg_fitness_flag and population_items:
+            scores = [f.score for f in population_items if f.score is not None]
+            if scores:
+                average_score = -sum(scores) / len(scores)
+                sections.append(
+                    f'Population average score: {average_score}'
+                )
+
+        return (f"Task Description: {info['task_description']}\n"
+                + '\n'.join(sections) + '\n'
+                "1.Lower scores indicate better algorithms.\n"
+                "2.Identify the most useful design insight and output one specific "
+                "improvement suggestion inside {}. Do not output code or extra explanations.\n")
+    @classmethod
+    def get_prompt_reflection_old(cls, children, parents=None, mode: int = 4, info: dict | None = None) -> str:
         """Build the reflection prompt using the task template's path format."""
         task_prompt = info['task_description']
         children = children if isinstance(children, list) else [children]

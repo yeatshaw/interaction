@@ -1,21 +1,26 @@
-template_program = '''
-def select_next_node(current_node: int, depot: int, unvisited_nodes: np.ndarray, rest_capacity: np.ndarray, current_time: np.ndarray,\
-                        demands: np.ndarray, distance_matrix: np.ndarray, time_windows: np.ndarray) -> int:
-    """Design a novel algorithm to select the next node in each step.
-    Args:
-        current_node: ID of the current node.
-        depot: ID of the depot.
-        unvisited_nodes: Array of IDs of unvisited nodes.
-        rest_capacity: Rest capacity of vehicle
-        current_time: Current time
-        demands: Demands of nodes
-        distance_matrix: Distance matrix of nodes.
-        time_windows: Time windows of nodes.
-    Return:
-        ID of the next node to visit.
-    """
-    next_node = unvisited_nodes[0]
-    return next_node
-'''
-
 task_description = "The task involves finding optimal routes for a fleet of vehicles to serve a set of customers, respecting time windows and vehicle capacity constraints. Help me design an algorithm to select the next node in each step."
+
+method_signature = 'current_node, depot, unvisited_nodes, rest_capacity, current_time, demands, distance_matrix, time_windows'
+class_args = ''
+method_args = '''
+select_next_node:
+    Args:
+        current_node: int, current node ID.
+        depot: int, depot ID.
+        unvisited_nodes: np.ndarray, feasible unvisited customer IDs.
+        rest_capacity: float, remaining vehicle capacity.
+        current_time: float, current route time.
+        demands: np.ndarray, customer demands.
+        distance_matrix: np.ndarray, pairwise travel distances.
+        time_windows: np.ndarray, [earliest, latest] service times.
+    Returns:
+        next_node: int, next customer ID or depot ID.
+'''
+func_template = '''thought:{...}
+```python
+Code:
+def <method_name>(<method_args>):
+    import ...
+    ...
+```
+'''

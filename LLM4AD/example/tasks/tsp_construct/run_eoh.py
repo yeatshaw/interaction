@@ -44,7 +44,7 @@ def main():
                  reflection_input_mode=reflection_mode,
                  lineage_log_path=lineage_path,
                  info=info,
-                 debug_mode=True)
+                 debug_mode=False)
     method.run()
 
 if __name__ == '__main__':

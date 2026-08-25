@@ -118,8 +118,26 @@ class HttpsApi(LLM):
                 }
                 conn.request('POST', '/v1/chat/completions', payload, headers)
                 res = conn.getresponse()
-                data = res.read().decode('utf-8')
-                data = json.loads(data)
+                raw_response = res.read().decode('utf-8', errors='replace')
+                try:
+                    data = json.loads(raw_response)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError(
+                        f'HTTP {res.status} {res.reason}; server returned non-JSON: '
+                        f'{raw_response[:500]}'
+                    ) from exc
+
+                if res.status < 200 or res.status >= 300:
+                    detail = data.get('error', data) if isinstance(data, dict) else data
+                    raise RuntimeError(
+                        f'HTTP {res.status} {res.reason}; API error: {detail}'
+                    )
+
+                if not isinstance(data, dict) or not data.get('choices'):
+                    raise RuntimeError(
+                        'API response does not contain choices; '
+                        f'response: {str(data)[:500]}'
+                    )
 
                 # Extract content from the standard response format
                 response = data['choices'][0]['message']['content']

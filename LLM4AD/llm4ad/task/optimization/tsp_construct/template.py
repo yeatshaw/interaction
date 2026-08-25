@@ -1,8 +1,8 @@
-task_description = "Now there's a Python class that implements an algorithm to solve the Traveling Salesman Problem (TSP) based on constructive heuristics."
+task_description = "Now there's a Python class that implements an algorithm to solve the Traveling Salesman Problem (TSP). Given a set of nodes with their coordinates, design a constructive heuristic that visits every node once and returns to the start while minimizing route  length. The algorithm selects one next node at each construction step."
 
 method_signature = (
-    'current_node: int, destination_node: int, '
-    'unvisited_nodes: np.ndarray, distance_matrix: np.ndarray'
+    'current_node, destination_node, '
+    'unvisited_nodes, distance_matrix'
 )
 
 class_args = '''
@@ -12,11 +12,11 @@ method_args = '''
 select_next_node:
     Args:
         current_node: int, ID of the current node.
-        destination_node: int, ID of the destination/start node.
-        unvisited_nodes: np.ndarray, IDs of all unvisited nodes.
-        distance_matrix: np.ndarray, Pairwise node distance matrix.
+        destination_node: int, ID of the destination node.
+        unvisited_nodes: np.ndarray, Array of IDs of unvisited nodes.
+        distance_matrix: np.ndarray, Distance matrix of nodes.
     Returns:
-        next_node: int, The ID of exactly one node from unvisited_nodes.
+        next_node: int, ID of the next node to visit.
 '''
 
 func_template = '''thought:{...}
@@ -28,16 +28,31 @@ def <method_name>(<method_args>):
 ```
 '''
 
+'''
+Task Description: {task_description}
+===== parent vs. child =====
+...
+
+===== best vs. worst =====
+...
+
+The average score of last generation is {avg_score}.
+Algorithm {id1} is generated after being guided by {corresponding guide 1}
+Algorithm {id1} is generated after being guided by {corresponding guide 2}
+'''
+
+
+
 #子代代码
 '''
 Task Description: {task_description}
 Here are a few pieces of algorithm code to complete the above tasks.
-## Algorithm 1 ##
+## Algorithm id1 ##
 Code:
 ```python
 ...
 ```
-## Algorithm n ##
+## Algorithm id2 ##
 Code:
 ```python
 ...
@@ -52,14 +67,38 @@ Reflect requirement:
 '''
 Task Description: {task_description}
 Here are a few pieces of algorithm code and their corresponding thoughts to complete the above tasks.
-## Algorithm 1 ##
+## Algorithm id1 ##
 thought: {...}
 Code:
 ```python
 ...
 ```
-## Algorithm n ##
+## Algorithm id2 ##
 thought: {...}
+Code:
+```python
+...
+```
+
+Reflect requirement:
+1.
+2.
+'''
+
+#子代代码+子代thought+分数
+'''
+Task Description: {task_description}
+Here are a few pieces of algorithm to complete the above tasks.
+## Algorithm id1 ##
+thought: {...}
+score:
+Code:
+```python
+...
+```
+## Algorithm id2 ##
+thought: {...}
+score:
 Code:
 ```python
 ...
@@ -75,27 +114,28 @@ Reflect requirement:
 Task Description: {task_description}
 Here are the reference algorithm sets from the previous algorithm design and the new algorithms generated from them.
 ## Evolution path 1 ##
-# Reference Algorithm #
-Code 1:
+# Reference Algorithm 1 #
+Code:
 ```python
 ...
 ```
-Code n:
+# Reference Algorithm n #
+Code:
 ```python
 ...
 ```
-# New Algorithm #
+# New Algorithm id #
 Code:
 ```python
 ...
 ```
 ## Evolution path n ##
-# Reference Algorithm #
+# Reference Algorithm id #
 Code:
 ```python
 ...
 ```
-# New Algorithm #
+# New Algorithm id #
 Code:
 ```python
 ...
@@ -111,31 +151,32 @@ Reflect requirement:
 Task Description: {task_description}
 Here are the reference algorithm sets from the previous algorithm design and the new algorithms generated from them.
 ## Evolution path 1 ##
-# Reference Algorithm #
-thought 1: {...}
-Code 1:
+# Reference Algorithm id1 #
+thought: {...}
+Code:
 ```python
 ...
 ```
-thought n: {...}
-Code n:
+# Reference Algorithm id2 #
+thought: {...}
+Code:
 ```python
 ...
 ```
-# New Algorithm #
+# New Algorithm id#
 thought: {...}
 Code:
 ```python
 ...
 ```
 ## Evolution path n ##
-# Reference Algorithm #
+# Reference Algorithm id #
 thought: {...}
 Code:
 ```python
 ...
 ```
-# New Algorithm #
+# New Algorithm id #
 thought: {...}
 Code:
 ```python
@@ -146,3 +187,67 @@ Reflect requirement:
 1.
 2.
 '''
+
+"""
+# Algorithm #
+thought: {...}
+score: 
+Code:
+```python
+...
+```
+"""
+
+#best vs. worst
+"""
+## Best Algorithm ##
+thought: {...}
+score: 
+Code:
+```python
+...
+```
+## Worst Algorithm ##
+thought: {...}
+score: 
+Code:
+```python
+...
+```
+"""
+
+"""
+===== best vs. worst =====
+## Best Algorithm ##
+...
+## Worst Algorithm ##
+...
+"""
+
+"""
+===== reference =====
+Here are a few pieces of algorithm to complete the above.
+## Algorithm 1 ##
+...
+## Algorithm n ##
+...
+"""
+
+"""
+===== parent vs. child =====
+Here are the reference algorithm sets from the previous algorithm design and the new algorithms generated from them.
+## Evolution path 1 ##
+# Reference Algorithm 1 #
+...
+# Reference Algorithm n #
+...
+# Generated Algorithm #
+...
+## Evolution path n ##
+# Reference Algorithm #
+...
+# Generated Algorithm #
+...
+"""
+
+

@@ -34,11 +34,14 @@
 from __future__ import annotations
 
 from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 import copy
+import os
+import pickle
 import numpy as np
 from llm4ad.base import Evaluation
 from llm4ad.task.optimization.vrptw_construct.get_instance import GetData
-from llm4ad.task.optimization.vrptw_construct.template import template_program, task_description
+from llm4ad.task.optimization.vrptw_construct.template import task_description
 
 
 class VRPTWEvaluation(Evaluation):
@@ -46,20 +49,35 @@ class VRPTWEvaluation(Evaluation):
                  timeout_seconds=30,
                  problem_size=50,
                  n_instance=16,
+                 dataset_path=None,
+                 instance_workers=1,
                  **kwargs):
 
         super().__init__(
-            template_program=template_program,
-            task_description=task_description,
             use_numba_accelerate=False,
             timeout_seconds=timeout_seconds
         )
 
         self.problem_size = problem_size
         self.n_instance = n_instance
+        self.instance_workers = instance_workers
 
-        getData = GetData(self.n_instance, self.problem_size + 1)
-        self._datasets = getData.generate_instances()
+        dataset_path = dataset_path or os.environ.get('LLM4AD_VRPTW_TRAIN_DATA')
+        if dataset_path:
+            with open(dataset_path, 'rb') as file:
+                self._datasets = pickle.load(file)
+            self._datasets = [
+                (np.asarray(coordinates), np.asarray(distance_matrix),
+                 np.asarray(demands), capacity, np.asarray(service_time),
+                 np.asarray(time_windows))
+                for coordinates, distance_matrix, demands, capacity,
+                service_time, time_windows in self._datasets
+            ]
+            self.n_instance = min(self.n_instance, len(self._datasets))
+            self.problem_size = len(self._datasets[0][0]) - 1
+        else:
+            getData = GetData(self.n_instance, self.problem_size)
+            self._datasets = getData.generate_instances()
 
     def tour_cost(self, distance_matrix, solution, time_service, time_windows):
         cost = 0
@@ -85,11 +103,8 @@ class VRPTWEvaluation(Evaluation):
     def evaluate_program(self, program_str: str, callable_func: callable) -> Any | None:
         return self.evaluate(callable_func)
 
-    def evaluate(self, heuristic):
-        dis = np.ones(self.n_instance)
-        n_ins = 0
-
-        for instance, distance_matrix, demands, vehicle_capacity, time_service, time_windows in self._datasets:
+    def _evaluate_instance(self, heuristic, data):
+            _, distance_matrix, demands, vehicle_capacity, time_service, time_windows = data
             route = []
             current_load = 0
             current_node = 0
@@ -153,15 +168,18 @@ class VRPTWEvaluation(Evaluation):
             if len(set(route)) != self.problem_size + 1:
                 return None
 
-            LLM_dis = self.tour_cost(distance_matrix, route, time_service, time_windows)
-            dis[n_ins] = LLM_dis
+            return self.tour_cost(distance_matrix, route, time_service, time_windows)
 
-            n_ins += 1
-            if n_ins == self.n_instance:
-                break
-        # print(dis)
-        ave_dis = np.average(dis)
-        return -ave_dis
+    def evaluate(self, heuristic):
+        datasets = self._datasets[:self.n_instance]
+        workers = min(self.instance_workers, len(datasets))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            distances = list(executor.map(
+                lambda data: self._evaluate_instance(heuristic, data), datasets
+            ))
+        if any(distance is None for distance in distances):
+            return None
+        return -float(np.average(distances))
 
 
 if __name__ == '__main__':

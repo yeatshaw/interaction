@@ -62,7 +62,11 @@ class EoH:
                  info: dict | None = None,
                  resume_mode: bool = False,
                  debug_mode: bool = False,
-                 reflection_input_mode: int = 4,
+                 reflection_parent_info: bool = False,
+                 reflection_best_worst: bool = False,
+                 reflection_fitness: int | None = None,
+                 reflection_avg_fitness: bool = False,
+                 reflection_check_guidance: bool = False,
                  lineage_log_path: str = 'eoh_lineage.json',
                  multi_thread_or_process_eval: Literal['thread', 'process'] = 'thread',
                  **kwargs):
@@ -104,9 +108,12 @@ class EoH:
         self._num_evaluators = num_evaluators
         self._resume_mode = resume_mode
         self._debug_mode = debug_mode
-        if reflection_input_mode not in (1, 2, 3, 4):
-            raise ValueError('reflection_input_mode must be one of 1, 2, 3, or 4.')
-        self._reflection_input_mode = reflection_input_mode
+
+        self._reflection_parent_info = reflection_parent_info
+        self._reflection_best_worst = reflection_best_worst
+        self._reflection_fitness = reflection_fitness
+        self._reflection_avg_fitness = reflection_avg_fitness
+        self._reflection_check_guidance = reflection_check_guidance
         self._reflection_suggestion = None
         llm.debug_mode = debug_mode
         self._multi_thread_or_process_eval = multi_thread_or_process_eval
@@ -186,7 +193,13 @@ class EoH:
     def _reflect(self, children, parents=None):
         """Generate a compact suggestion; reflection text is not registered as a child."""
         prompt = EoHPrompt.get_prompt_reflection(
-            children, parents, self._reflection_input_mode, self._info
+            children, parents=parents, info=self._info,
+            parent_info_flag=self._reflection_parent_info,
+            best_worst_flag=self._reflection_best_worst,
+            fitness_flag=self._reflection_fitness,
+            avg_fitness_flag=self._reflection_avg_fitness,
+            check_reflection_flag=self._reflection_check_guidance,
+            population=self._population
         )
         try:
             suggestion = self._sampler.llm.draw_sample(prompt)
@@ -449,7 +462,7 @@ class EoH:
         # evolutionary search
         # Generations are built as exact pop_size batches; run this coordinator
         # in one thread so survival happens only after each complete batch.
-        self._iteratively_use_eoh_operator()
+        self._multi_threaded_sampling(self._iteratively_use_eoh_operator())
 
         # finish
         if self._profiler is not None:
