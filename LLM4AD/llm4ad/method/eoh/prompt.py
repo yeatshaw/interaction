@@ -51,17 +51,26 @@ class EoHPrompt:
             node_id = getattr(func, '_eoh_lineage_id', None)
             return f'Algorithm {node_id}' if node_id is not None else fallback
 
-        def block(func, label, include_score=True, include_guidance=False):
-            text = f'{label}\n'
+        def block(func, include_score=True, include_guidance=False):
+            text = ''
             if fitness_flag >= 1:
-                text += f'thought: {getattr(func, "algorithm", "")}\n'
+                thought = str(getattr(func, 'algorithm', '') or '').strip()
+                # Records created by older runs may contain a formatting label
+                # in the stored thought. Keep the reflection field clean.
+                if thought == 'Code:':
+                    thought = ''
+                text += f'thought: {thought}\n'
             if fitness_flag >= 2 and include_score:
                 text += f'score: {display_score(func)}\n'
             if include_guidance and check_reflection_flag:
                 guide = getattr(func, '_eoh_generation_suggestion', None)
                 if guide:
                     text += f'This algorithm is generated after being guided by {guide}\n'
-            text += f'Code:\n```python\n{str(func).rstrip()}\n```'
+            if hasattr(func, 'to_code_without_docstring'):
+                source = func.to_code_without_docstring().rstrip()
+            else:
+                source = str(func).rstrip()
+            text += f'Code:\n```python\n{source}\n```'
             return text
 
         sections = []
@@ -78,15 +87,21 @@ class EoHPrompt:
             )
         for i, child in enumerate(children, 1):
             child_label = f'Algorithm {i}'
-            section = [f'## {child_label} ##',
-                       block(child, 'Code', include_guidance=True)]
             if has_parent:
                 group = parent_groups[i - 1]
-                if group:
-                    section.append('# Reference Algorithm #')
-                    for j, parent in enumerate(group, 1):
-                        section.append('# Reference Algorithm #')
-                        section.append(block(parent, 'Code'))
+                path_label = ('## Evolution path ##' if len(children) == 1
+                              else f'## Evolution path {i} ##')
+                section = [path_label]
+                for j, parent in enumerate(group, 1):
+                    parent_label = ('# Reference Algorithm #' if len(group) == 1
+                                    else f'# Reference Algorithm {j} #')
+                    section.append(parent_label)
+                    section.append(block(parent))
+                section.append('# Generated Algorithm #')
+                section.append(block(child, include_guidance=True))
+            else:
+                section = [f'## {child_label} ##',
+                           block(child, include_guidance=True)]
             sections.append('\n'.join(section))
 
         population_items = list(getattr(population, 'population', population or []))
@@ -95,9 +110,9 @@ class EoHPrompt:
             sections.append('===== best vs. worst =====\n'
                             'Here are the best and worst algorithms in the current population\n'
                             '## Best Algorithm ##\n' +
-                            block(ranked[0], 'Code') + '\n' +
+                            block(ranked[0]) + '\n' +
                             '## Worst Algorithm ##\n' +
-                            block(ranked[-1], 'Code'))
+                            block(ranked[-1]))
         if avg_fitness_flag and population_items:
             scores = [f.score for f in population_items if f.score is not None]
             if scores:
@@ -111,53 +126,7 @@ class EoHPrompt:
                 "1.Lower scores indicate better algorithms.\n"
                 "2.Identify the most useful design insight and output one specific "
                 "improvement suggestion inside {}. Do not output code or extra explanations.\n")
-    @classmethod
-    def get_prompt_reflection_old(cls, children, parents=None, mode: int = 4, info: dict | None = None) -> str:
-        """Build the reflection prompt using the task template's path format."""
-        task_prompt = info['task_description']
-        children = children if isinstance(children, list) else [children]
-        parents = parents or [[] for _ in children]
-        def code_block(code, label='Code'):
-            return f'{label}:\n```python\n{code}\n```'
 
-        def child_section(item, index, include_thought):
-            prefix = f'## Algorithm {index} ##\n'
-            thought = f'thought: {getattr(item, "algorithm", "")}\n' if include_thought else ''
-            return prefix + thought + code_block(str(item))
-
-        if mode in (1, 2):
-            sections = '\n'.join(child_section(item, i + 1, mode == 2)
-                                  for i, item in enumerate(children))
-            evidence = (
-                'Here are a few pieces of algorithm code to complete the above tasks.\n'
-                if mode == 1 else
-                'Here are a few pieces of algorithm code and their corresponding thoughts to complete the above task.\n'
-            ) + sections
-        else:
-            paths = []
-            for i, (child, group) in enumerate(zip(children, parents), 1):
-                multiple = len(group) > 1
-                refs = []
-                for j, parent in enumerate(group, 1):
-                    suffix = f' {j}' if multiple else ''
-                    thought = (f'thought{suffix}: {getattr(parent, "algorithm", "")}\n'
-                               if mode == 4 else '')
-                    refs.append(f'Code{suffix}:\n```python\n{parent}\n```' if mode == 3
-                                else thought + f'Code{suffix}:\n```python\n{parent}\n```')
-                new_thought = (f'thought: {getattr(child, "algorithm", "")}\n' if mode == 4 else '')
-                paths.append(
-                    f'## Evolution path {i} ##\n# Reference Algorithm #\n'
-                    + '\n'.join(refs) + '\n# New Algorithm #\n'
-                    + new_thought + code_block(str(child))
-                )
-            evidence = ('Here are the reference algorithm sets from the previous algorithm design and the new algorithms generated from them.\n'
-                        + '\n'.join(paths))
-        if mode not in (1, 2, 3, 4):
-            raise ValueError('reflection_input_mode must be one of 1, 2, 3, or 4.')
-        return f'''Task:{task_prompt}
-{evidence}
-Identify the most useful design insight from the provided algorithm(s). Then, output a specific improvement suggestion within {{}}, without outputting code or extra explanations.
-'''
     @classmethod
     def get_prompt_design(cls, info, indivs, suggestion):
         method_name, method_args, func_template, class_args = cls._template_values(info)
