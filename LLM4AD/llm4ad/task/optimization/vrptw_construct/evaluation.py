@@ -35,7 +35,6 @@ from __future__ import annotations
 
 from typing import Any
 import multiprocessing as mp
-import copy
 import os
 import pickle
 import numpy as np
@@ -125,9 +124,9 @@ class VRPTWEvaluation(Evaluation):
                                       feasible_unvisited_nodes,
                                       vehicle_capacity - current_load,
                                       current_time,
-                                      copy.deepcopy(demands),
-                                      copy.deepcopy(distance_matrix),
-                                      copy.deepcopy(time_windows))
+                                      demands,
+                                      distance_matrix,
+                                      time_windows)
                 if next_node == 0:
                     route.append(next_node)
                     current_load = 0
@@ -172,18 +171,11 @@ class VRPTWEvaluation(Evaluation):
 
     def evaluate(self, program_source):
         datasets = self._datasets[:self.n_instance]
-        workers = min(self.instance_workers, len(datasets))
-        try:
-            with mp.Pool(processes=workers) as pool:
-                distances = pool.starmap(
-                    self._evaluate_instance,
-                    [(program_source, data) for data in datasets]
-                )
-        except Exception as exc:
-            # Keep evaluation correct if a worker cannot be started or the
-            # evaluator instance cannot be serialized.
-            print(f'VRPTW instance parallel evaluation failed; falling back to serial: {exc}')
-            distances = [self._evaluate_instance(program_source, data) for data in datasets]
+        # Evaluate instances serially. Candidate-level parallelism is managed
+        # by EoH; creating a process pool here causes nested pools and large
+        # Windows spawn/serialization overhead.
+        distances = [self._evaluate_instance(program_source, data)
+                     for data in datasets]
         if any(distance is None for distance in distances):
             return None
         return -float(np.average(distances))

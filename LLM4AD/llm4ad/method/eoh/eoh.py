@@ -136,6 +136,8 @@ class EoH:
         self._lineage_log_path = os.path.abspath(lineage_log_path)
         self._lineage_base = os.path.splitext(self._lineage_log_path)[0]
         self._lineage_shard_size = 100
+        self._lineage_cache = []
+        self._lineage_cache_start = 1
         self._next_lineage_id = 1
         self._lineage_lock = Lock()
         self._initialize_lineage_file()
@@ -285,6 +287,9 @@ class EoH:
             with open(filename, encoding='utf-8') as file:
                 nodes = json.load(file).get('nodes', [])
             max_id = max((int(node['node_id']) for node in nodes), default=0)
+            shard_start = ((max_id - 1) // self._lineage_shard_size) * self._lineage_shard_size + 1 if max_id else 1
+            self._lineage_cache_start = shard_start
+            self._lineage_cache = list(nodes) if len(nodes) < self._lineage_shard_size else []
         except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise ValueError(f'Invalid lineage JSON file: {filename}') from exc
         self._next_lineage_id = max_id + 1
@@ -313,14 +318,19 @@ class EoH:
                 os.remove(temp_path)
 
     def _append_lineage_record(self, record):
-        path = self._lineage_shard_path(record['node_id'])
-        try:
-            with open(path, encoding='utf-8') as file:
-                data = json.load(file)
-        except (FileNotFoundError, json.JSONDecodeError):
-            data = {'nodes': []}
-        data.setdefault('nodes', []).append(record)
-        self._write_lineage_shard(record['node_id'], data['nodes'])
+        shard_start = ((int(record['node_id']) - 1) // self._lineage_shard_size) * self._lineage_shard_size + 1
+        if shard_start != self._lineage_cache_start:
+            self._flush_lineage_cache()
+            self._lineage_cache_start = shard_start
+            self._lineage_cache = []
+        self._lineage_cache.append(record)
+        if len(self._lineage_cache) >= self._lineage_shard_size:
+            self._flush_lineage_cache()
+
+    def _flush_lineage_cache(self):
+        if self._lineage_cache:
+            self._write_lineage_shard(self._lineage_cache_start, self._lineage_cache)
+            self._lineage_cache = []
 
     def get_lineage_parents(self, func):
         """Return parent Function objects even after population survival removes them."""
@@ -414,7 +424,7 @@ class EoH:
         while self._continue_loop():
             try:
                 # get a new func using e1
-                indivs = [self._population.selection() for _ in range(self._selection_num)]
+                indivs = self._population.selection_many(self._selection_num)
                 # 对indivs进行反思得到建议
                 self._prepare_reflection(indivs)
                 prompt = EoHPrompt.get_prompt_e1(indivs, self._info, self._reflection_suggestion)
@@ -426,7 +436,7 @@ class EoH:
                 
                 # get a new func using e2
                 if self._use_e2_operator:
-                    indivs = [self._population.selection() for _ in range(self._selection_num)]
+                    indivs = self._population.selection_many(self._selection_num)
                     self._prepare_reflection(indivs)
                     prompt = EoHPrompt.get_prompt_e2(indivs, self._info, self._reflection_suggestion)
                     if self._debug_mode:
@@ -525,5 +535,8 @@ class EoH:
         # finish
         if self._profiler is not None:
             self._profiler.finish()
+
+        with self._lineage_lock:
+            self._flush_lineage_cache()
 
         self._sampler.llm.close()

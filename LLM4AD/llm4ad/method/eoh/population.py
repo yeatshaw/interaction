@@ -79,10 +79,20 @@ class Population:
                 return True
         return False
 
-    def selection(self) -> Function:
+    def selection(self, replace: bool = True) -> Function:
         funcs = [f for f in self._population if not math.isinf(f.score)]
         func = sorted(funcs, key=lambda f: f.score, reverse=True)
         p = [1 / (r + len(func)) for r in range(len(func))]
         p = np.array(p)
         p = p / np.sum(p)
-        return np.random.choice(func, p=p)
+        return np.random.choice(func, p=p, replace=replace)
+
+    def selection_many(self, count: int) -> list[Function]:
+        """Select distinct individuals using the same weighted policy."""
+        funcs = [f for f in self._population if not math.isinf(f.score)]
+        if count > len(funcs):
+            raise ValueError(f'Cannot select {count} distinct individuals from {len(funcs)}.')
+        funcs = sorted(funcs, key=lambda f: f.score, reverse=True)
+        p = np.array([1 / (r + len(funcs)) for r in range(len(funcs))], dtype=float)
+        p /= np.sum(p)
+        return list(np.random.choice(funcs, size=count, replace=False, p=p))
