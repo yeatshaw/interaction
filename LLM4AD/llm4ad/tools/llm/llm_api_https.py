@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import time
 from typing import Any
 import traceback
+from urllib.parse import urlparse
 from ...base import LLM
 
 
@@ -101,7 +103,26 @@ class HttpsApi(LLM):
         # Retry loop for handling network or API transient errors
         while True:
             try:
-                conn = http.client.HTTPSConnection(self._host, timeout=self._timeout)
+                # Use an explicitly configured HTTP proxy when available;
+                # otherwise preserve the original direct HTTPS connection.
+                proxy_url = (os.environ.get('HTTPS_PROXY') or
+                             os.environ.get('https_proxy') or
+                             os.environ.get('HTTP_PROXY') or
+                             os.environ.get('http_proxy'))
+                if proxy_url:
+                    proxy = urlparse(proxy_url if '://' in proxy_url
+                                     else f'http://{proxy_url}')
+                    if not proxy.hostname:
+                        raise ValueError(f'Invalid proxy URL: {proxy_url}')
+                    conn = http.client.HTTPSConnection(
+                        proxy.hostname, proxy.port or 8080,
+                        timeout=self._timeout
+                    )
+                    conn.set_tunnel(self._host, 443)
+                else:
+                    conn = http.client.HTTPSConnection(
+                        self._host, timeout=self._timeout
+                    )
 
                 # Prepare standard OpenAI-compatible payload
                 payload = json.dumps({
