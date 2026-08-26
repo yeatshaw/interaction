@@ -71,6 +71,9 @@ def main():
                             reflection_fitness=reflection_fitness,
                             reflection_avg_fitness=reflection_avg_fitness,
                             reflection_check_guidance=reflection_check_guidance,
+                            use_long_term_reflection=(
+                                os.environ.get('LLM4AD_LONG_TERM_REFLECTION', '1') == '1'
+                            ),
                             lineage_log_path='eoh_lineage.json',
                             info=info,
                             debug_mode=False

@@ -11,7 +11,8 @@ class EoHPrompt:
     def get_prompt_reflection(cls, children, parents=None, info=None,
                               parent_info_flag=False, best_worst_flag=False,
                               fitness_flag=0, avg_fitness_flag=False,
-                              check_reflection_flag=False, population=None) -> str:
+                              check_reflection_flag=False, population=None,
+                              use_long_term_reflection=True) -> str:
         """Build a reflection prompt for the input ablation study.
 
         Defaults are the baseline: selected child code only. ``fitness_flag``
@@ -66,7 +67,8 @@ class EoHPrompt:
                 guide = getattr(func, '_eoh_generation_suggestion', None)
                 if guide:
                     text += f'This algorithm is generated after being guided by {guide}\n'
-                experience = getattr(func, '_eoh_experience', None)
+                experience = (getattr(func, '_eoh_experience', None)
+                              if use_long_term_reflection else None)
                 if experience:
                     text += f'This path evolved into the algorithm, and the summarized experience is {experience}.\n'
             if hasattr(func, 'to_code_without_docstring'):

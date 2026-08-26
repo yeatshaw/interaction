@@ -67,6 +67,7 @@ class EoH:
                  reflection_fitness: int | None = None,
                  reflection_avg_fitness: bool = False,
                  reflection_check_guidance: bool = True,
+                 use_long_term_reflection: bool = True,
                  lineage_log_path: str = 'eoh_lineage.json',
                  multi_thread_or_process_eval: Literal['thread', 'process'] = 'thread',
                  **kwargs):
@@ -114,6 +115,7 @@ class EoH:
         self._reflection_fitness = reflection_fitness
         self._reflection_avg_fitness = reflection_avg_fitness
         self._reflection_check_guidance = reflection_check_guidance
+        self._use_long_term_reflection = use_long_term_reflection
         self._reflection_suggestion = None
         self._reflection_experience = None
         llm.debug_mode = debug_mode
@@ -206,7 +208,8 @@ class EoH:
             fitness_flag=self._reflection_fitness,
             avg_fitness_flag=self._reflection_avg_fitness,
             check_reflection_flag=self._reflection_check_guidance,
-            population=self._population
+            population=self._population,
+            use_long_term_reflection=self._use_long_term_reflection
         )
         print(f'\nReflection Prompt: {prompt}\n')
         try:
@@ -233,12 +236,15 @@ class EoH:
 
     def _prepare_reflection(self, refs):
         if not self._population.population:
+            self._reflection_suggestion = None
+            self._reflection_experience = None
             return
         lineage_parents = [self.get_lineage_parents(child) for child in refs]
         self._reflection_suggestion = self._reflect(refs, lineage_parents)
         # Long-term reflection is only possible when at least one reference
         # has a parent and therefore carries prior reflective information.
-        if any(getattr(ref, '_eoh_parent_ids', ()) for ref in refs):
+        if (self._use_long_term_reflection and
+                any(getattr(ref, '_eoh_parent_ids', ()) for ref in refs)):
             self._reflection_experience = self._reflect_experience(refs)
         else:
             self._reflection_experience = None
