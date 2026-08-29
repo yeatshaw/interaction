@@ -35,31 +35,27 @@ def main():
     
     # Four bits are, in order: parent, best/worst, population average,
     # reflection guidance.  Thus 1000 enables parent information only.
+    bits = os.environ.get('LLM4AD_REFLECTION_BITS', '1111')
     for run in range(3):
         for reflection_fitness in range(3):
-            for combo in range(16):
-                bits = f'{combo:04b}'
-                reflection_parent_info = bits[0] == '1'
-                reflection_best_worst = bits[1] == '1'
-                reflection_avg_fitness = bits[2] == '1'
-                reflection_check_guidance = bits[3] == '1'
-                run_log_dir = base_log_dir / str(reflection_fitness) / bits / str(run)
-                llm = HttpsApi(
-                    host='api.apilio.ai',
-                    key='',
-                    model='gpt-4o-mini',
-                    timeout=60
-                )
-                task = VRPTWEvaluation(
+            reflection_parent_info = bits[0] == '1'
+            reflection_best_worst = bits[1] == '1'
+            reflection_avg_fitness = bits[2] == '1'
+            reflection_check_guidance = bits[3] == '1'
+            run_log_dir = base_log_dir / str(reflection_fitness) / bits / str(run)
+            llm = HttpsApi(
+                host='api.apilio.ai', key='', model='gpt-4o-mini', timeout=60
+            )
+            task = VRPTWEvaluation(
                     timeout_seconds=300,
                     dataset_path='/public/home/liuyang/dataset/vrptw_instances.pkl',
                     n_instance=100,
                     instance_workers=10
-                )
-                print(f'Running reflection_fitness={reflection_fitness}, combination={bits}, run={run}')
-                method = EoH(
-                            llm=llm,
-                            profiler=EoHProfiler(log_dir=str(run_log_dir), log_style='complex'),
+            )
+            print(f'Running reflection_fitness={reflection_fitness}, combination={bits}, run={run}')
+            method = EoH(
+                        llm=llm,
+                        profiler=EoHProfiler(log_dir=str(run_log_dir), log_style='complex'),
                             evaluation=task,
                             max_sample_nums=500,
                             max_generations=500,
@@ -77,9 +73,9 @@ def main():
                             lineage_log_path='eoh_lineage.json',
                             info=info,
                             debug_mode=False
-                        )
-                method.run()
-                save_convergence_plot(method._profiler._log_dir, method._convergence_history)
+                    )
+            method.run()
+            save_convergence_plot(method._profiler._log_dir, method._convergence_history)
 
 
 if __name__ == '__main__':
