@@ -32,16 +32,35 @@ def save_convergence_plot(log_dir, convergence_history):
 def main():
     base_log_dir = Path(os.environ.get('LLM4AD_LOG_DIR', 'logs/eoh_vrptw_非反思算子'))
     info = get_info('select_next_node', 'llm4ad.task.optimization.vrptw_construct.template')
-    
-    # Four bits are, in order: parent, best/worst, population average,
-    # reflection guidance.  Thus 1000 enables parent information only.
-    bits = os.environ.get('LLM4AD_REFLECTION_BITS', '1111')
-    for run in range(3):
-        for reflection_fitness in range(3):
-            reflection_parent_info = bits[0] == '1'
-            reflection_best_worst = bits[1] == '1'
-            reflection_avg_fitness = bits[2] == '1'
-            reflection_check_guidance = bits[3] == '1'
+
+    # Main reflection ablation settings.  The three behaviors are independent
+    # and can be enabled together.  Environment variables override defaults.
+    reflection_comparison_flag = os.environ.get('LLM4AD_REFLECTION_COMPARISON', '1') == '1'
+    reflection_attribution_flag = os.environ.get('LLM4AD_REFLECTION_ATTRIBUTION', '0') == '1'
+    reflection_summarization_flag = os.environ.get('LLM4AD_REFLECTION_SUMMARY', '0') == '1'
+    reflection_attribution = os.environ.get('LLM4AD_ATTRIBUTION_TYPE', 'good')
+    reflection_summarization = os.environ.get('LLM4AD_SUMMARY_TYPE', 'guidance')
+
+    # Comparison input ablation.  The two flags form four combinations:
+    # neither, identical parent sets, at least one shared parent, or both.
+    population_comparison = os.environ.get('LLM4AD_POPULATION_COMPARISON', '') or None
+    identical_parent_children = os.environ.get('LLM4AD_IDENTICAL_PARENTS', '0') == '1'
+    shared_parent_children = os.environ.get('LLM4AD_SHARED_PARENT', '0') == '1'
+
+    # Two-bit input setting: population average and reflection guidance.
+    # Parent and elite/worst inputs are controlled by the dedicated settings above.
+    bits = os.environ.get('LLM4AD_REFLECTION_BITS', '11')
+    if len(bits) != 2 or any(bit not in '01' for bit in bits):
+        raise ValueError('LLM4AD_REFLECTION_BITS must be a two-bit string, e.g. 01.')
+    runs = [int(os.environ['LLM4AD_RUN_INDEX'])] if os.environ.get('LLM4AD_RUN_INDEX') else range(3)
+    fitness_values = ([int(os.environ['LLM4AD_REFLECTION_FITNESS'])]
+                      if os.environ.get('LLM4AD_REFLECTION_FITNESS') else range(3))
+    for run in runs:
+        for reflection_fitness in fitness_values:
+            reflection_parent_info = False
+            reflection_best_worst = False
+            reflection_avg_fitness = bits[0] == '1'
+            reflection_check_guidance = bits[1] == '1'
             run_log_dir = base_log_dir / str(reflection_fitness) / bits / str(run)
             llm = HttpsApi(
                 host='api.apilio.ai', key='', model='gpt-4o-mini', timeout=60
@@ -67,6 +86,14 @@ def main():
                             reflection_fitness=reflection_fitness,
                             reflection_avg_fitness=reflection_avg_fitness,
                             reflection_check_guidance=reflection_check_guidance,
+                            reflection_identical_parent_children=identical_parent_children,
+                            reflection_shared_parent_children=shared_parent_children,
+                            reflection_population_comparison=population_comparison,
+                            reflection_comparison_flag=reflection_comparison_flag,
+                            reflection_attribution_flag=reflection_attribution_flag,
+                            reflection_summarization_flag=reflection_summarization_flag,
+                            reflection_attribution=reflection_attribution,
+                            reflection_summarization=reflection_summarization,
                             use_long_term_reflection=(
                                 os.environ.get('LLM4AD_LONG_TERM_REFLECTION', '1') == '1'
                             ),

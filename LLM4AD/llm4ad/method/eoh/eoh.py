@@ -67,6 +67,15 @@ class EoH:
                  reflection_fitness: int | None = None,
                  reflection_avg_fitness: bool = False,
                  reflection_check_guidance: bool = True,
+                 reflection_identical_parent_children: bool = False,
+                 reflection_shared_parent_children: bool = False,
+                 reflection_population_comparison: Optional[str] = None,
+                 reflection_method: Optional[str] = None,
+                 reflection_comparison_flag: bool = True,
+                 reflection_attribution_flag: bool = False,
+                 reflection_summarization_flag: bool = False,
+                 reflection_attribution: str = 'good',
+                 reflection_summarization: str = 'guidance',
                  use_long_term_reflection: bool = True,
                  lineage_log_path: str = 'eoh_lineage.json',
                  multi_thread_or_process_eval: Literal['thread', 'process'] = 'thread',
@@ -115,6 +124,29 @@ class EoH:
         self._reflection_fitness = reflection_fitness
         self._reflection_avg_fitness = reflection_avg_fitness
         self._reflection_check_guidance = reflection_check_guidance
+        self._reflection_identical_parent_children = reflection_identical_parent_children
+        self._reflection_shared_parent_children = reflection_shared_parent_children
+        self._reflection_population_comparison = reflection_population_comparison
+        # ``reflection_method`` is retained as a compatibility shortcut.  The
+        # three flags are independent and may be enabled together.
+        if reflection_method is not None:
+            if reflection_method not in {'comparison', 'attribution', 'summarization'}:
+                raise ValueError('reflection_method must be comparison, attribution, or summarization.')
+            reflection_comparison_flag = reflection_method == 'comparison'
+            reflection_attribution_flag = reflection_method == 'attribution'
+            reflection_summarization_flag = reflection_method == 'summarization'
+        if not any((reflection_comparison_flag, reflection_attribution_flag,
+                    reflection_summarization_flag)):
+            raise ValueError('At least one reflection behavior flag must be enabled.')
+        if reflection_attribution not in {'good', 'bad', 'both', 'difference', 'same'}:
+            raise ValueError('Invalid reflection_attribution.')
+        if reflection_summarization not in {'guidance', 'experience', 'conditions'}:
+            raise ValueError('Invalid reflection_summarization.')
+        self._reflection_comparison_flag = reflection_comparison_flag
+        self._reflection_attribution_flag = reflection_attribution_flag
+        self._reflection_summarization_flag = reflection_summarization_flag
+        self._reflection_attribution = reflection_attribution
+        self._reflection_summarization = reflection_summarization
         self._use_long_term_reflection = use_long_term_reflection
         self._reflection_suggestion = None
         self._reflection_experience = None
@@ -209,7 +241,15 @@ class EoH:
             avg_fitness_flag=self._reflection_avg_fitness,
             check_reflection_flag=self._reflection_check_guidance,
             population=self._population,
-            use_long_term_reflection=self._use_long_term_reflection
+            use_long_term_reflection=self._use_long_term_reflection,
+            identical_parent_children_flag=self._reflection_identical_parent_children,
+            shared_parent_children_flag=self._reflection_shared_parent_children,
+            population_comparison=self._reflection_population_comparison,
+            comparison_flag=self._reflection_comparison_flag,
+            attribution_flag=self._reflection_attribution_flag,
+            summarization_flag=self._reflection_summarization_flag,
+            attribution_task=self._reflection_attribution,
+            summarization_task=self._reflection_summarization,
         )
         print(f'\nReflection Prompt: {prompt}\n')
         try:
