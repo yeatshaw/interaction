@@ -30,7 +30,7 @@ def save_convergence_plot(log_dir, convergence_history):
 
 
 def main():
-    base_log_dir = Path(os.environ.get('LLM4AD_LOG_DIR', 'logs/eoh_vrptw_非反思算子'))
+    base_log_dir = Path(os.environ.get('LLM4AD_LOG_DIR', 'logs/eoh'))
     info = get_info('select_next_node', 'llm4ad.task.optimization.vrptw_construct.template')
 
     # Main reflection ablation settings.  The three behaviors are independent
@@ -69,7 +69,7 @@ def main():
                     timeout_seconds=300,
                     dataset_path='/public/home/liuyang/dataset/vrptw_instances.pkl',
                     n_instance=100,
-                    instance_workers=10
+                    instance_workers=1
             )
             print(f'Running reflection_fitness={reflection_fitness}, combination={bits}, run={run}')
             method = EoH(
@@ -94,9 +94,7 @@ def main():
                             reflection_summarization_flag=reflection_summarization_flag,
                             reflection_attribution=reflection_attribution,
                             reflection_summarization=reflection_summarization,
-                            use_long_term_reflection=(
-                                os.environ.get('LLM4AD_LONG_TERM_REFLECTION', '1') == '1'
-                            ),
+                            use_long_term_reflection=False,
                             lineage_log_path='eoh_lineage.json',
                             info=info,
                             debug_mode=False

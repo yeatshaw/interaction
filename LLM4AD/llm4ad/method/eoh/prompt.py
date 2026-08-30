@@ -77,7 +77,7 @@ class EoHPrompt:
             blocks.append('candidate score')
         if avg_fitness_flag:
             blocks.append('population mean score')
-        return 'Feedback input blocks:\n' + '\n'.join(f'- {b}' for b in blocks)
+        return '\n'.join(f'- {b}' for b in blocks)
 
     @staticmethod
     def _build_parent_child_input(children, parent_groups, algorithm_block):
@@ -100,7 +100,7 @@ class EoHPrompt:
                 parent_label = ('# Reference Algorithm #' if len(group) == 1
                                 else f'# Reference Algorithm {j} #')
                 section.extend((parent_label,
-                                algorithm_block(parent, include_guidance=True)))
+                                algorithm_block(parent, include_guidance=False)))
             section.extend(('# Generated Algorithm #',
                             algorithm_block(child, include_guidance=True)))
             sections.append('\n'.join(section))
@@ -111,8 +111,8 @@ class EoHPrompt:
                                      second_label, second, algorithm_block):
         return [
             f'===== {title} =====\n{description}\n'
-            f'## {first_label} ##\n{algorithm_block(first, include_guidance=True)}\n'
-            f'## {second_label} ##\n{algorithm_block(second, include_guidance=True)}'
+            f'## {first_label} ##\n{algorithm_block(first, include_guidance=False)}\n'
+            f'## {second_label} ##\n{algorithm_block(second, include_guidance=False)}'
         ]
 
     @classmethod
@@ -189,7 +189,7 @@ class EoHPrompt:
             for index, parent in enumerate(parent_groups[0], 1):
                 sections.append(
                     f'## Parent Algorithm {index} ##\n'
-                    f'{algorithm_block(parent, include_guidance=True)}')
+                    f'{algorithm_block(parent, include_guidance=False)}')
             for index, child in enumerate(children, 1):
                 sections.append(
                     f'## Child Algorithm {index} ##\n'
@@ -205,7 +205,7 @@ class EoHPrompt:
             for index, parent in enumerate(shared_parents, 1):
                 sections.append(
                     f'## Shared Parent Algorithm {index} ##\n'
-                    f'{algorithm_block(parent, include_guidance=True)}')
+                    f'{algorithm_block(parent, include_guidance=False)}')
             for child_index, (child, group) in enumerate(
                     zip(children, parent_groups), 1):
                 sections.append(
@@ -220,7 +220,7 @@ class EoHPrompt:
                     for parent_index, parent in enumerate(non_shared, 1):
                         subsection.extend((
                             f'# Non-shared Parent {parent_index} #',
-                            algorithm_block(parent, include_guidance=True),
+                            algorithm_block(parent, include_guidance=False),
                         ))
                     sections.append('\n'.join(subsection))
         return sections, task
@@ -386,7 +386,6 @@ class EoHPrompt:
                 'summarization', summarization_task))
 
         return (f"===== Task Description =====\n{info['task_description']}\n"
-                "===== Input Information =====\n"
                 + cls._reflection_input_block(
                     parent_info_flag if comparison_enabled else False,
                     best_worst_flag if comparison_enabled else False,
@@ -400,9 +399,7 @@ class EoHPrompt:
                 + cls._reflection_output_block(
                     output_fields, insight_flag, cause_flag,
                     suggestion_flag, experience_flag) + '\n'
-                "===== Generation Constraint =====\n"
-                + cls.requirements() + '\n'
-                "Do not output code or extra explanations.\n")
+                )
 
     @classmethod
     def get_prompt_design(cls, info, indivs, suggestion):
