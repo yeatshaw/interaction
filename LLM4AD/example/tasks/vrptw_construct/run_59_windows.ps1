@@ -1,9 +1,11 @@
+param([int]$StartId = 0, [int]$EndId = 58)
 $root = 'D:\LiuY\interaction\LLM4AD'
 $script = Join-Path $root 'example\tasks\vrptw_construct\run_eoh.py'
 $logRoot = Join-Path $root 'logs\vrptw_59'
 New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 
 function Start-Experiment($id, $comp, $attr, $summ, $attrType, $summType, $identical, $shared, $pop) {
+    if ($id -lt $StartId -or $id -gt $EndId) { return }
     $name = '{0:D2}' -f $id
     $dir = Join-Path $logRoot $name
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -49,4 +51,4 @@ foreach ($comp in 0..1) {
     }
   }
 }
-Write-Host "Started $id experiments."
+Write-Host "Started experiments in range $StartId-$EndId."
