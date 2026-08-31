@@ -1,35 +1,25 @@
-template_program = '''
-import numpy as np
-def select_next_node(current_node: int, depot: int, unvisited_nodes: np.ndarray, rest_capacity: np.ndarray, demands: np.ndarray, distance_matrix: np.ndarray) -> int:
-    """Design a novel algorithm to select the next node in each step.
+task_description = ('Construct capacity-feasible CVRP routes by selecting the next customer '
+                    'at each step, minimizing total travel distance.')
+
+method_signature = 'current_node, depot, unvisited_nodes, rest_capacity, demands, distance_matrix'
+class_args = ''
+method_args = '''
+select_next_node:
     Args:
-        current_node: ID of the current node.
-        depot: ID of the depot.
-        unvisited_nodes: Array of IDs of unvisited nodes.
-        rest_capacity: rest capacity of vehicle
-        demands: demands of nodes
-        distance_matrix: Distance matrix of nodes.
-    Return:
-        ID of the next node to visit.
-    """
-    best_score = -1
-    next_node = -1
-
-    for node in unvisited_nodes:
-        demand = demands[node]
-        distance = distance_matrix[current_node][node]
-
-        if demand <= rest_capacity:
-            score = demand / distance if distance > 0 else float('inf')  # Avoid division by zero
-            if score > best_score:
-                best_score = score
-                next_node = node
-
-    return next_node
+        current_node: int, current node ID.
+        depot: int, depot node ID.
+        unvisited_nodes: np.ndarray, feasible unvisited customer IDs.
+        rest_capacity: float, remaining vehicle capacity.
+        demands: np.ndarray, demand of every node.
+        distance_matrix: np.ndarray, pairwise travel distances.
+    Returns:
+        next_node: int, one ID from unvisited_nodes or depot.
 '''
-
-task_description = """
-Given a set of customers and a fleet of vehicles with limited capacity,
-the task is to design a novel algorithm to select the next node in each step,
-with the objective of minimizing the total cost.
-"""
+func_template = '''thought:{...}
+```python
+Code:
+def <method_name>(<method_args>):
+    import ...
+    ...
+```
+'''
