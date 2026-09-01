@@ -1,4 +1,5 @@
 import csv
+import importlib
 import json
 import os
 import sys
@@ -24,13 +25,26 @@ def _best_program(log_dir):
     return (records[-1].get('program') or records[-1].get('function')) if records else None
 
 
+def _load_object_npz(path, key):
+    """Read object NPZ files created by NumPy 2.x with NumPy 1.x."""
+    if 'numpy._core' not in sys.modules:
+        sys.modules['numpy._core'] = importlib.import_module('numpy.core')
+        for module in ('multiarray', 'numeric', '_multiarray_umath'):
+            try:
+                sys.modules[f'numpy._core.{module}'] = importlib.import_module(
+                    f'numpy.core.{module}')
+            except ImportError:
+                pass
+    with np.load(path, allow_pickle=True) as loaded:
+        return loaded[key].item()
+
+
 def evaluate_taillard(log_dir, dataset_path):
     """Load Taillard only after training and preserve file/instance ordering."""
     program = _best_program(log_dir)
     if not program:
         return
-    with np.load(dataset_path, allow_pickle=True) as loaded:
-        datasets = loaded['fsp_dict'].item()
+    datasets = _load_object_npz(dataset_path, 'fsp_dict')
     evaluator = FSSPEvaluation(n_instance=1, n_jobs=1, n_machines=1)
     rows = []
     for file_name in sorted(datasets):
