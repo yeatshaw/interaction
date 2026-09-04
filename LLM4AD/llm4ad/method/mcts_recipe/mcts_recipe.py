@@ -69,6 +69,13 @@ class MCTSRecipe:
             and entry.name[len("checkpoint_"):-5].isdigit()
         ), default=0)
         self._tree_lock = threading.RLock()
+        self._best_samples = self.store.load_best_samples()
+        self._best_score = max(
+            (record.get("score", float("-inf")) for record in self._best_samples
+             if record.get("score") is not None),
+            default=float("-inf"),
+        )
+        self._total_sample_count = 0
         self._seed = seed
         if seed is not None:
             random.seed(seed)
@@ -83,7 +90,12 @@ class MCTSRecipe:
         best = max(x.score for x in population.individuals)
         root = RecipeNode(self._next_population_node_id, best, depth=0)
         self.tree.root = root
+        self._record_best_candidates(population.individuals, root)
         self._write_node(root, population, None, [])
+        # Persist the root once immediately. Subsequent nodes use batching.
+        if self.store.flush() is not None:
+            self._checkpoint_index += 1
+            self._write_checkpoint()
         return root
 
     def _assign_algorithm_ids(self, individuals):
@@ -91,6 +103,38 @@ class MCTSRecipe:
             if getattr(item, "_recipe_algorithm_id", None) is None:
                 item._recipe_algorithm_id = self._next_algorithm_id
                 self._next_algorithm_id += 1
+
+    def _record_best_candidates(self, individuals, population_node):
+        """Append every strict global improvement in evaluation order."""
+        changed = False
+        for individual in individuals:
+            self._total_sample_count += 1
+            score = getattr(individual, "score", None)
+            if score is None or score <= self._best_score:
+                continue
+            code = (individual.to_code_without_docstring()
+                    if hasattr(individual, "to_code_without_docstring")
+                    else str(individual))
+            self._best_score = float(score)
+            self._best_samples.append({
+                "sample_order": self._total_sample_count,
+                "algorithm_id": getattr(individual, "_recipe_algorithm_id", None),
+                "population_node_id": population_node.population_node_id,
+                "depth": population_node.depth,
+                "recipe_id": getattr(individual, "_recipe_id", None),
+                "operator": getattr(individual, "operator", None),
+                "parent_algorithm_ids": list(
+                    getattr(individual, "_eoh_parent_ids", ())),
+                "algorithm": getattr(individual, "algorithm", ""),
+                "function": code,
+                "program": code,
+                "score": score,
+                "evaluate_time": getattr(individual, "evaluate_time", None),
+                "sample_time": getattr(individual, "sample_time", None),
+            })
+            changed = True
+        if changed:
+            self.store.write_best_samples(self._best_samples)
 
     def _write_node(self, node, population, recipe_id, experiences):
         flushed = self.store.add(
@@ -171,6 +215,8 @@ class MCTSRecipe:
                     max(x.score for x in child_population.individuals),
                     depth=node.depth + 1, parent=node,
                     incoming_recipe_id=recipe_id)
+                if offspring:
+                    self._record_best_candidates(offspring, child)
                 node.add_child(child)
                 # One completed recipe edge is one visit to its new child and
                 # one additional visit propagated through every ancestor.
@@ -194,6 +240,10 @@ class MCTSRecipe:
         else:
             if initial_individuals is None:
                 raise ValueError("initial_individuals is required for a new run")
+            if self.store.next_file_start > 1:
+                raise FileExistsError(
+                    f"{self.store.directory} already contains population nodes; "
+                    "use a new LLM4AD_LOG_DIR or set LLM4AD_CHECKPOINT")
             self.initialize(initial_individuals)
         while True:
             node = self.tree.select()
@@ -234,9 +284,15 @@ class MCTSRecipe:
             raise ValueError("checkpoint does not contain a root node")
         self.tree.root = root
         self._next_population_node_id = int(
-            state.get("last_population_node_id",
-                      state.get("next_population_node_id", 1) - 1))
+            state.get("next_population_node_id",
+                      state.get("last_population_node_id", 0) + 1))
         self._next_algorithm_id = int(state["next_algorithm_id"])
+        self._total_sample_count = int(state.get(
+            "total_sample_count",
+            max((item.get("sample_order", 0) for item in self._best_samples),
+                default=0),
+        ))
+        self._best_score = float(state.get("best_score", self._best_score))
         self.restore_random_state(state)
 
     def _write_checkpoint(self):
@@ -262,6 +318,8 @@ class MCTSRecipe:
             "last_population_node_id": self._next_population_node_id,
             "next_population_node_id": self._next_population_node_id + 1,
             "next_algorithm_id": self._next_algorithm_id,
+            "total_sample_count": self._total_sample_count,
+            "best_score": self._best_score,
             "max_depth": self.max_depth,
             "pop_size": self.pop_size,
             "selection_num": self.selection_num,

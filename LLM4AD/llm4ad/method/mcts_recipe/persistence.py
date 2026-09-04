@@ -126,3 +126,26 @@ class RecipeStore:
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
+
+    @property
+    def best_sample_path(self):
+        return os.path.join(self.directory, "sample_best.json")
+
+    def load_best_samples(self):
+        try:
+            with open(self.best_sample_path, encoding="utf-8") as f:
+                payload = json.load(f)
+            return payload if isinstance(payload, list) else []
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+
+    def write_best_samples(self, records):
+        """Atomically replace the small global-best history file."""
+        fd, tmp = tempfile.mkstemp(prefix=".sample_best_", dir=self.directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.best_sample_path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)

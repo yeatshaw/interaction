@@ -26,17 +26,22 @@ from llm4ad.method.mcts_recipe import (
 class OpenAIEmbedding:
     """Small OpenAI-compatible embedding adapter used by RefineEvo."""
 
-    def __init__(self, api_key, base_url, model):
+    def __init__(self, api_key, base_url, model, encoding_format="float"):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.encoding_format = encoding_format
 
     def encode(self, texts):
         single = isinstance(texts, str)
         inputs = [texts] if single else list(texts)
         request = urllib.request.Request(
             f"{self.base_url}/embeddings",
-            data=json.dumps({"model": self.model, "input": inputs}).encode("utf-8"),
+            data=json.dumps({
+                "model": self.model,
+                "input": inputs,
+                "encoding_format": self.encoding_format,
+            }).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -118,6 +123,9 @@ def run_task(*, method_name, template_module, evaluation, llm,
     checkpoint = os.environ.get("LLM4AD_CHECKPOINT")
     if checkpoint:
         store_dir = Path(checkpoint).resolve().parent
+    store_dir = Path(store_dir).resolve()
+    store_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Recipe-MCTS output directory: {store_dir}", flush=True)
     initial = (None if checkpoint else
                _initial_population(llm, evaluation, info, pop_size,
                                    selection_num, num_samplers, debug))
@@ -129,7 +137,10 @@ def run_task(*, method_name, template_module, evaluation, llm,
         api_key=os.environ.get("LLM4AD_EMBEDDING_API_KEY",
                                os.environ.get("LLM4AD_API_KEY", "")),
         base_url=embedding_host,
-        model=os.environ.get("LLM4AD_EMBEDDING_MODEL", "text-embedding-v4"),
+        model=os.environ.get(
+            "LLM4AD_EMBEDDING_MODEL", "text-embedding-3-small"),
+        encoding_format=os.environ.get(
+            "LLM4AD_EMBEDDING_ENCODING_FORMAT", "float"),
     )
     experience_manager = RefineEvoExperienceManager(
         reflector_llm=llm,
@@ -177,8 +188,12 @@ def run_task(*, method_name, template_module, evaluation, llm,
 
 
 def common_options(default_log):
+    configured_log = os.environ.get("LLM4AD_LOG_DIR")
+    repository_root = Path(__file__).resolve().parents[2]
+    store_dir = (Path(configured_log) if configured_log
+                 else repository_root / default_log)
     return {
-        "store_dir": Path(os.environ.get("LLM4AD_LOG_DIR", default_log)),
+        "store_dir": store_dir,
         "pop_size": _int_env("LLM4AD_POP_SIZE", 10),
         "selection_num": _int_env("LLM4AD_SELECTION_NUM", 2),
         "max_depth": _int_env("LLM4AD_MAX_DEPTH", 50),
