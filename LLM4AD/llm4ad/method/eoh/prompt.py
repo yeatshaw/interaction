@@ -615,6 +615,6 @@ This is the format for your reply:
 These are some suggestions after reflecting on the given algorithms:
 {suggestion}
 Please refer to the given suggestions and identify the main algorithm parameters and assist me in creating a new algorithm that has a different parameter settings of the score function provided.
-{cls._requirements()}
+        {cls.requirements()}
 Do not give additional explanations.'''
         return prompt_content
