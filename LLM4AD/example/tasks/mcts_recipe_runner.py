@@ -116,7 +116,7 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
 
 def run_task(*, method_name, template_module, evaluation, llm,
              store_dir, pop_size=10, selection_num=2, max_depth=50,
-             num_samplers=10, num_evaluators=1, debug=False):
+             num_samplers=10, num_evaluators=10, debug=False):
     from example.tasks.utils import get_info
 
     info = get_info(method_name, template_module)
@@ -198,6 +198,9 @@ def common_options(default_log):
         "selection_num": _int_env("LLM4AD_SELECTION_NUM", 2),
         "max_depth": _int_env("LLM4AD_MAX_DEPTH", 50),
         "num_samplers": _int_env("LLM4AD_NUM_SAMPLERS", 10),
-        "num_evaluators": _int_env("LLM4AD_NUM_EVALUATORS", 1),
+        # Keep generation and evaluation parallel by default.  Set this to a
+        # smaller value on machines where each safe evaluation starts a child
+        # process or the task itself uses many CPU threads.
+        "num_evaluators": _int_env("LLM4AD_NUM_EVALUATORS", 10),
         "debug": os.environ.get("LLM4AD_DEBUG", "0") == "1",
     }

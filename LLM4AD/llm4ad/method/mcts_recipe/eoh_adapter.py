@@ -27,12 +27,28 @@ class EoHRecipeExpander:
         self.sampler = EoHSampler(llm, template_program)
         self.evaluator = SecureEvaluator(evaluation, debug_mode=debug_mode,
                                          **evaluator_kwargs)
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=num_evaluators)
         self.num_samplers = max(1, int(num_samplers))
+        self.num_evaluators = max(1, int(num_evaluators))
+        # Sampling and evaluation are deliberately separate pools.  A sampling
+        # worker never waits for evaluation; the whole generated batch is
+        # submitted to ``evaluation_executor`` after all sampling futures have
+        # completed.
+        self.sampler_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.num_samplers)
+        self.evaluation_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.num_evaluators)
+        # Keep the old attribute for callers that inspected the adapter.
+        self.executor = self.evaluation_executor
+        self._prompt_lock = threading.RLock()
+        self._closed = False
         self.debug_mode = debug_mode
 
     def close(self, close_llm=True):
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        if self._closed:
+            return
+        self._closed = True
+        self.sampler_executor.shutdown(wait=True, cancel_futures=True)
+        self.evaluation_executor.shutdown(wait=True, cancel_futures=True)
         if close_llm:
             self.sampler.llm.close()
 
@@ -66,10 +82,17 @@ class EoHRecipeExpander:
         # falls back to the reference-only section.
         return list(getattr(ref, "_recipe_parent_functions", ()))
 
-    def _generate(self, refs, population, recipe, operator):
-        # Front-loaded reflection. References without lineage parents use the
-        # reference section; later generations use parents vs children.
-        suggestion = self._reflect(refs, population, recipe)
+    def _generation_prompt(self, refs, suggestion, operator):
+        """Build an operator prompt without serializing LLM calls.
+
+        ``EoHPrompt`` clears the copied Functions' docstrings while formatting
+        them.  The lock protects that formatter, while the actual LLM request
+        remains outside the lock and therefore runs in parallel.
+        """
+        with self._prompt_lock:
+            return self._generation_prompt_unlocked(refs, suggestion, operator)
+
+    def _generation_prompt_unlocked(self, refs, suggestion, operator):
         if operator == "e1":
             prompt = EoHPrompt.get_prompt_e1(refs, self.info, suggestion)
         elif operator == "e2":
@@ -78,54 +101,153 @@ class EoHRecipeExpander:
             prompt = EoHPrompt.get_prompt_m1(refs[0], self.info, suggestion)
         else:
             prompt = EoHPrompt.get_prompt_m2(refs[0], self.info, suggestion)
+        return prompt
+
+    def _prepare_candidate(self, refs, population, recipe, operator):
+        """Perform reflection and LLM/code generation, but do not evaluate.
+
+        The returned dictionary is intentionally independent of evaluation so
+        many of these tasks can be generated concurrently and then evaluated
+        as one batch.
+        """
         sample_start = time.time()
-        thought, function = self.sampler.get_thought_and_function(prompt)
+        try:
+            # Front-loaded reflection. References without lineage parents use
+            # the reference section; later generations use parents vs children.
+            suggestion = self._reflect(refs, population, recipe)
+            prompt = self._generation_prompt(refs, suggestion, operator)
+            thought, function = self.sampler.get_thought_and_function(prompt)
+            if thought is None or function is None:
+                return None
+            program = TextFunctionProgramConverter.function_to_program(
+                function, self.template_program)
+            if program is None:
+                return None
+        except Exception as exc:
+            if self.debug_mode:
+                print(f"DEBUG: candidate generation failed: {exc}")
+            return None
+
         sample_time = time.time() - sample_start
-        if thought is None or function is None:
-            return None
-        program = TextFunctionProgramConverter.function_to_program(function, self.template_program)
-        if program is None:
-            return None
-        score, eval_time = self.executor.submit(
-            self.evaluator.evaluate_program_record_time, program).result()
         function.algorithm = thought
-        function.score = score
-        function.evaluate_time = eval_time
         function.sample_time = sample_time
         function.operator = operator
         function._eoh_parent_ids = tuple(
             getattr(ref, "_recipe_algorithm_id", None) for ref in refs)
         function._recipe_id = recipe.recipe_id
         function._eoh_generation_suggestion = suggestion
-        return function if score is not None else None
+        return {
+            "function": function,
+            "program": program,
+            "refs": refs,
+            "operator": operator,
+            "suggestion": suggestion,
+            "sample_time": sample_time,
+        }
+
+    def _evaluate_candidates(self, candidates):
+        """Evaluate a prepared batch concurrently and return feasible entries."""
+        if not candidates:
+            return []
+        futures = {
+            self.evaluation_executor.submit(
+                self.evaluator.evaluate_program_record_time,
+                candidate["program"]): candidate
+            for candidate in candidates
+        }
+        evaluated = []
+        for future, candidate in futures.items():
+            try:
+                result = future.result()
+                if not isinstance(result, tuple) or len(result) != 2:
+                    score, eval_time = None, None
+                else:
+                    score, eval_time = result
+            except Exception as exc:
+                if self.debug_mode:
+                    print(f"DEBUG: candidate evaluation failed: {exc}")
+                score, eval_time = None, None
+            if score is None:
+                continue
+            function = candidate["function"]
+            function.score = score
+            function.evaluate_time = eval_time
+            evaluated.append(candidate)
+        return evaluated
+
+    def _generate(self, refs, population, recipe, operator):
+        """Compatibility wrapper for one candidate through the two-stage path."""
+        candidate = self._prepare_candidate(
+            copy.deepcopy(list(refs)), population, recipe, operator)
+        evaluated = self._evaluate_candidates([candidate] if candidate else [])
+        if not evaluated:
+            return None
+        function = evaluated[0]["function"]
+        return function
 
     def __call__(self, population, recipe, selection_num, target_size):
-        offspring = []
         operators = ("e1", "e2", "m1", "m2")
-        next_operator = 0
-        lock = threading.Lock()
+        # Keep a bad/invalid LLM response from spinning forever.  This is the
+        # same two-sample-per-slot budget used by EoH initialization; a short
+        # batch simply causes the MCTS caller to inherit the parent population.
+        max_attempts = max(int(target_size) * 2, int(target_size))
+        specs = []
+        for index in range(max_attempts):
+            operator = operators[index % len(operators)]
+            try:
+                count = selection_num if operator in ("e1", "e2") else 1
+                refs = copy.deepcopy(population.select_many(count))
+            except Exception as exc:
+                if self.debug_mode:
+                    print(f"DEBUG: reference selection failed: {exc}")
+                refs = None
+            if refs:
+                specs.append((refs, population, recipe, operator))
 
-        def sample_one(operator):
-            refs = population.select_many(
-                selection_num if operator in ("e1", "e2") else 1)
-            return self._generate(refs, population, recipe, operator)
-
-        while len(offspring) < target_size:
-            batch_size = target_size - len(offspring)
-            batch_operators = []
-            for _ in range(batch_size):
-                batch_operators.append(operators[next_operator % len(operators)])
-                next_operator += 1
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(batch_size, self.num_samplers)) as executor:
-                futures = [executor.submit(sample_one, operator)
-                           for operator in batch_operators]
-                for future in futures:
-                    function = future.result()
-                    if function is not None:
-                        with lock:
-                            offspring.append(function)
+        # Node-level barrier: every LLM/code-generation future completes
+        # before the first evaluation future is submitted.
+        prepared = list(self.sampler_executor.map(
+            lambda spec: self._prepare_candidate(*spec), specs))
+        evaluated = self._evaluate_candidates(
+            [candidate for candidate in prepared if candidate is not None])
+        offspring = [candidate["function"] for candidate in evaluated[:target_size]]
+        if len(offspring) < target_size and self.debug_mode:
+            print(f"DEBUG: recipe {recipe.recipe_id} produced "
+                  f"{len(offspring)}/{target_size} feasible candidates "
+                  f"after {len(specs)} attempts")
         return offspring
+
+    def _generate_without_reflection(self, refs, recipe, operator="e1"):
+        """Generate one child using the original EoH operator prompt."""
+        try:
+            refs = copy.deepcopy(list(refs))
+            prompt = self._generation_prompt(refs, None, operator)
+            sample_start = time.time()
+            thought, function = self.sampler.get_thought_and_function(prompt)
+            if thought is None or function is None:
+                return None
+            program = TextFunctionProgramConverter.function_to_program(
+                function, self.template_program)
+            if program is None:
+                return None
+            function.algorithm = thought
+            function.sample_time = time.time() - sample_start
+            function.operator = operator
+            function._recipe_id = recipe.recipe_id
+            function._eoh_parent_ids = tuple(
+                getattr(ref, "_recipe_algorithm_id", None) for ref in refs)
+            candidate = {"function": function, "program": program,
+                         "refs": refs, "operator": operator}
+            evaluated = self._evaluate_candidates([candidate])
+            return evaluated[0]["function"] if evaluated else None
+        except Exception as exc:
+            if self.debug_mode:
+                print(f"DEBUG: candidate generation failed: {exc}")
+            return None
+
+    # The implementation below is retained for compatibility with code that
+    # directly called the old methods.  Normal node expansion uses ``__call__``
+    # and the strict two-stage batch path above.
 
 class RefineEvoRecipeExpander(EoHRecipeExpander):
     """Front-loaded RefineEvo-style experience retrieval and reflection.
@@ -154,122 +276,154 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
         return child_score is not None and (not scores or child_score > max(scores))
 
     def _generate_without_reflection(self, refs, recipe):
-        """Generate one child using the original EoH operator prompt."""
-        # UNCERTAIN: keep the same operator schedule as EoH for now.
+        """Compatibility wrapper for the old no-experience call site."""
         operator = getattr(self, "_next_operator", "e1")
-        if operator == "e1":
-            prompt = EoHPrompt.get_prompt_e1(refs, self.info, None)
-        elif operator == "e2":
-            prompt = EoHPrompt.get_prompt_e2(refs, self.info, None)
-        elif operator == "m1":
-            prompt = EoHPrompt.get_prompt_m1(refs[0], self.info, None)
-        else:
-            prompt = EoHPrompt.get_prompt_m2(refs[0], self.info, None)
-        thought, function = self.sampler.get_thought_and_function(prompt)
-        if thought is None or function is None:
-            return None, operator
-        program = TextFunctionProgramConverter.function_to_program(function, self.template_program)
-        if program is None:
-            return None, operator
-        score, eval_time = self.executor.submit(
-            self.evaluator.evaluate_program_record_time, program).result()
+        function = super()._generate_without_reflection(refs, recipe, operator)
+        return function, operator
+
+    def _prepare_experience_candidate(self, refs, recipe, operator,
+                                      parent_experiences):
+        """Retrieve/distill experience and generate one candidate.
+
+        This is the sampling phase of RefineEvo.  Distillation may itself call
+        the reflector LLM, so it stays in the sampler pool; no evaluation is
+        started until every candidate in the batch has reached this method's
+        return point.
+        """
+        sample_start = time.time()
+        try:
+            retrieved = (self.retrieve_experiences(
+                refs, operator, list(parent_experiences))
+                if self.retrieve_experiences else [])
+            retrieved = retrieved if isinstance(retrieved, list) else []
+            fresh = (self.distill_experience(refs, operator)
+                     if self.distill_experience else [])
+            fresh = fresh if isinstance(fresh, list) else ([fresh] if fresh else [])
+            guidance = self._format_experiences(retrieved + fresh)
+            prompt = self._generation_prompt(refs, guidance or None, operator)
+            if guidance:
+                prompt = prompt.replace(
+                    "These are some suggestions after reflecting on the given algorithms:",
+                    "These are successful and failed design experiences retrieved from previous attempts:")
+            thought, function = self.sampler.get_thought_and_function(prompt)
+            if thought is None or function is None:
+                return None
+            program = TextFunctionProgramConverter.function_to_program(
+                function, self.template_program)
+            if program is None:
+                return None
+        except Exception as exc:
+            if self.debug_mode:
+                print(f"DEBUG: RefineEvo candidate generation failed: {exc}")
+            return None
+
+        sample_time = time.time() - sample_start
         function.algorithm = thought
-        function.score = score
-        function.evaluate_time = eval_time
+        function.sample_time = sample_time
         function.operator = operator
         function._recipe_id = recipe.recipe_id
         function._eoh_parent_ids = tuple(
             getattr(ref, "_recipe_algorithm_id", None) for ref in refs)
-        return (function if score is not None else None), operator
+        # Preserve the experience actually supplied to the operator on the
+        # individual as well as in the node-level experience pool.
+        function._eoh_experience = guidance or None
+        return {
+            "function": function,
+            "program": program,
+            "refs": refs,
+            "operator": operator,
+            "retrieved": retrieved,
+            "fresh": fresh,
+            "experience_text": guidance,
+            "sample_time": sample_time,
+        }
 
     def __call__(self, population, recipe, selection_num, target_size,
                  experiences=None):
-        offspring, new_experiences = [], []
         parent_experiences = list(experiences or [])
         experience_lock = threading.RLock()
         manager = getattr(self.retrieve_experiences, "__self__", None)
         if manager is not None and hasattr(manager, "begin_node"):
             manager.begin_node(parent_experiences)
         operators = ("e1", "e2", "m1", "m2")
-        next_operator = 0
+        max_attempts = max(int(target_size) * 2, int(target_size))
 
-        def sample_one(operator):
-            refs = population.select_many(
-                selection_num if operator in ("e1", "e2") else 1)
-            retrieved = (self.retrieve_experiences(
-                refs, operator, list(parent_experiences))
-                if self.retrieve_experiences else [])
-            fresh = (self.distill_experience(refs, operator)
-                     if self.distill_experience else [])
-            fresh = fresh if isinstance(fresh, list) else ([fresh] if fresh else [])
-            guidance = self._format_experiences(retrieved + fresh)
-            child, _ = self._generate_with_experience(
-                refs, recipe, guidance, operator=operator)
-            return child, refs, retrieved, fresh
-
-        while len(offspring) < target_size:
-            batch_size = target_size - len(offspring)
-            batch_operators = []
-            for _ in range(batch_size):
-                batch_operators.append(operators[next_operator % len(operators)])
-                next_operator += 1
-            with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=min(batch_size, self.num_samplers)) as executor:
-                results = list(executor.map(sample_one, batch_operators))
+        try:
+            # Freeze one node-local experience snapshot for the complete
+            # generation phase.  No evaluation or score update happens yet.
             with experience_lock:
-                for child, refs, retrieved, fresh in results:
-                    if child is None:
-                        continue
+                experience_snapshot = copy.deepcopy(parent_experiences)
+            specs = []
+            for index in range(max_attempts):
+                operator = operators[index % len(operators)]
+                try:
+                    count = selection_num if operator in ("e1", "e2") else 1
+                    refs = copy.deepcopy(population.select_many(count))
+                except Exception as exc:
+                    if self.debug_mode:
+                        print(f"DEBUG: reference selection failed: {exc}")
+                    refs = None
+                if refs:
+                    specs.append((refs, recipe, operator, experience_snapshot))
+            prepared = list(self.sampler_executor.map(
+                lambda spec: self._prepare_experience_candidate(*spec), specs))
+            evaluated = self._evaluate_candidates(
+                [candidate for candidate in prepared if candidate is not None])
+
+            # The node-local experience pool is mutated only after the whole
+            # candidate batch has been evaluated.
+            offspring, new_experiences = [], []
+            with experience_lock:
+                for candidate in evaluated[:target_size]:
+                    child = candidate["function"]
+                    refs = candidate["refs"]
+                    retrieved = candidate["retrieved"]
+                    fresh = candidate["fresh"]
                     offspring.append(child)
                     improved = self._objective_improved(child, refs)
-                    retrieved_ids = {item.get("experience_id") for item in retrieved}
+                    retrieved_ids = {
+                        item.get("experience_id") for item in retrieved
+                        if isinstance(item, dict)
+                    }
                     retained = []
                     for item in parent_experiences:
+                        if not isinstance(item, dict):
+                            retained.append(item)
+                            continue
                         if item.get("experience_id") in retrieved_ids:
                             item["score"] = int(item.get("score", 0)) + (
                                 1 if improved else -1)
                         if int(item.get("score", 0)) >= 0:
                             retained.append(item)
                     parent_experiences[:] = retained
-                    new_experiences.extend(fresh)
-        if isinstance(experiences, list):
-            experiences[:] = parent_experiences
-        if manager is not None and hasattr(manager, "end_node"):
-            manager.end_node()
+                    new_experiences.extend(copy.deepcopy(fresh))
+        finally:
+            if isinstance(experiences, list):
+                experiences[:] = parent_experiences
+            if manager is not None and hasattr(manager, "end_node"):
+                manager.end_node()
+        if len(offspring) < target_size and self.debug_mode:
+            print(f"DEBUG: recipe {recipe.recipe_id} produced "
+                  f"{len(offspring)}/{target_size} feasible candidates "
+                  f"after {len(specs)} attempts")
         return offspring, new_experiences
 
     def _generate_with_experience(self, refs, recipe, experience_text,
                                   operator=None):
+        """Compatibility wrapper through the prepared/evaluated path."""
         operator = operator or getattr(self, "_next_operator", "e1")
-        if operator == "e1":
-            prompt = EoHPrompt.get_prompt_e1(refs, self.info, experience_text or None)
-        elif operator == "e2":
-            prompt = EoHPrompt.get_prompt_e2(refs, self.info, experience_text or None)
-        elif operator == "m1":
-            prompt = EoHPrompt.get_prompt_m1(refs[0], self.info, experience_text or None)
-        else:
-            prompt = EoHPrompt.get_prompt_m2(refs[0], self.info, experience_text or None)
+        candidate = self._prepare_experience_candidate(
+            copy.deepcopy(list(refs)), recipe, operator, [])
+        if candidate is None:
+            return None, operator
+        # The compatibility argument is already formatted text, while the
+        # normal path retrieves it inside ``_prepare_experience_candidate``.
         if experience_text:
-            prompt = prompt.replace(
-                "These are some suggestions after reflecting on the given algorithms:",
-                "These are successful and failed design experiences retrieved from previous attempts:")
-        sample_start = time.time()
-        thought, function = self.sampler.get_thought_and_function(prompt)
-        sample_time = time.time() - sample_start
-        if thought is None or function is None:
+            candidate["function"]._eoh_experience = experience_text
+        evaluated = self._evaluate_candidates([candidate])
+        if not evaluated:
             return None, operator
-        program = TextFunctionProgramConverter.function_to_program(function, self.template_program)
-        if program is None:
-            return None, operator
-        score, eval_time = self.executor.submit(
-            self.evaluator.evaluate_program_record_time, program).result()
-        function.algorithm, function.score = thought, score
-        function.evaluate_time, function.operator = eval_time, operator
-        function.sample_time = sample_time
-        function._recipe_id = recipe.recipe_id
-        function._eoh_parent_ids = tuple(
-            getattr(ref, "_recipe_algorithm_id", None) for ref in refs)
-        return (function if score is not None else None), operator
+        return evaluated[0]["function"], operator
 
     @staticmethod
     def _format_experiences(experiences):

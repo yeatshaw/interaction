@@ -70,11 +70,18 @@ class MCTSRecipe:
         ), default=0)
         self._tree_lock = threading.RLock()
         self._best_samples = self.store.load_best_samples()
-        self._best_score = max(
-            (record.get("score", float("-inf")) for record in self._best_samples
-             if record.get("score") is not None),
-            default=float("-inf"),
-        )
+        # Older runs may contain the previous append-only format.  Normalize
+        # it in memory to the single best record used by the current runner.
+        valid_best = [record for record in self._best_samples
+                      if isinstance(record, dict)
+                      and record.get("score") is not None]
+        if valid_best:
+            best_record = max(valid_best, key=lambda item: float(item["score"]))
+            self._best_samples = [best_record]
+            self._best_score = float(best_record["score"])
+        else:
+            self._best_samples = []
+            self._best_score = float("-inf")
         self._total_sample_count = 0
         self._seed = seed
         if seed is not None:
@@ -88,7 +95,9 @@ class MCTSRecipe:
             raise ValueError("initial population cannot be empty")
         self._assign_algorithm_ids(population.individuals)
         best = max(x.score for x in population.individuals)
-        root = RecipeNode(self._next_population_node_id, best, depth=0)
+        root_id = self._next_population_node_id
+        self._next_population_node_id += 1
+        root = RecipeNode(root_id, best, depth=0)
         self.tree.root = root
         self._record_best_candidates(population.individuals, root)
         self._write_node(root, population, None, [])
@@ -105,8 +114,14 @@ class MCTSRecipe:
                 self._next_algorithm_id += 1
 
     def _record_best_candidates(self, individuals, population_node):
-        """Append every strict global improvement in evaluation order."""
-        changed = False
+        """Keep and persist exactly one strict global-best record.
+
+        This method is called only after an individual has been evaluated.  A
+        candidate is compared with the process-wide ``_best_score``; when it
+        improves that value, ``sample_best.json`` is atomically overwritten so
+        it always describes the current best algorithm rather than a history
+        of all improvements.
+        """
         for individual in individuals:
             self._total_sample_count += 1
             score = getattr(individual, "score", None)
@@ -116,7 +131,7 @@ class MCTSRecipe:
                     if hasattr(individual, "to_code_without_docstring")
                     else str(individual))
             self._best_score = float(score)
-            self._best_samples.append({
+            best_record = {
                 "sample_order": self._total_sample_count,
                 "algorithm_id": getattr(individual, "_recipe_algorithm_id", None),
                 "population_node_id": population_node.population_node_id,
@@ -131,9 +146,8 @@ class MCTSRecipe:
                 "score": score,
                 "evaluate_time": getattr(individual, "evaluate_time", None),
                 "sample_time": getattr(individual, "sample_time", None),
-            })
-            changed = True
-        if changed:
+            }
+            self._best_samples = [best_record]
             self.store.write_best_samples(self._best_samples)
 
     def _write_node(self, node, population, recipe_id, experiences):
@@ -209,9 +223,10 @@ class MCTSRecipe:
                     child_population = branch_population.survival(offspring)
                 else:
                     child_population = branch_population.inherited_next_generation()
+                child_id = self._next_population_node_id
                 self._next_population_node_id += 1
                 child = RecipeNode(
-                    self._next_population_node_id,
+                    child_id,
                     max(x.score for x in child_population.individuals),
                     depth=node.depth + 1, parent=node,
                     incoming_recipe_id=recipe_id)
@@ -315,8 +330,10 @@ class MCTSRecipe:
                 })
                 stack.extend(node.children)
         state = {
-            "last_population_node_id": self._next_population_node_id,
-            "next_population_node_id": self._next_population_node_id + 1,
+            # The counter always points to the next unused ID.  Keep both
+            # fields for compatibility with older checkpoints.
+            "last_population_node_id": max(0, self._next_population_node_id - 1),
+            "next_population_node_id": self._next_population_node_id,
             "next_algorithm_id": self._next_algorithm_id,
             "total_sample_count": self._total_sample_count,
             "best_score": self._best_score,
