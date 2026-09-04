@@ -171,12 +171,15 @@ class VRPTWEvaluation(Evaluation):
 
     def evaluate(self, program_source):
         datasets = self._datasets[:self.n_instance]
+        if not datasets:
+            return None
         # Evaluate instances serially. Candidate-level parallelism is managed
         # by EoH; creating a process pool here causes nested pools and large
         # Windows spawn/serialization overhead.
         distances = [self._evaluate_instance(program_source, data)
                      for data in datasets]
-        if any(distance is None for distance in distances):
+        if any(distance is None or not np.isfinite(distance)
+               for distance in distances):
             return None
         return -float(np.average(distances))
 

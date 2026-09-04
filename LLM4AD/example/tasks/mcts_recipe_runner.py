@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 import concurrent.futures
+import math
 import json
 import urllib.request
 from pathlib import Path
@@ -84,7 +85,10 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
         if program is None:
             return None
         score, eval_time = evaluator.evaluate_program_record_time(program)
-        if score is None:
+        if score is None or not isinstance(score, (int, float)) \
+                or not math.isfinite(float(score)):
+            if debug and score is not None:
+                print(f"DEBUG: rejected non-finite initialization score: {score}")
             return None
         function.algorithm = thought
         function.score = score

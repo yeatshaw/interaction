@@ -70,14 +70,15 @@ class MCTSRecipe:
         ), default=0)
         self._tree_lock = threading.RLock()
         self._best_samples = self.store.load_best_samples()
-        # Older runs may contain the previous append-only format.  Normalize
-        # it in memory to the single best record used by the current runner.
+        # Keep the append-only improvement history used by EoH.  The current
+        # global best is the last/highest record, while every strict
+        # improvement remains available for convergence analysis.
         valid_best = [record for record in self._best_samples
                       if isinstance(record, dict)
                       and record.get("score") is not None]
         if valid_best:
             best_record = max(valid_best, key=lambda item: float(item["score"]))
-            self._best_samples = [best_record]
+            self._best_samples = list(self._best_samples)
             self._best_score = float(best_record["score"])
         else:
             self._best_samples = []
@@ -114,13 +115,13 @@ class MCTSRecipe:
                 self._next_algorithm_id += 1
 
     def _record_best_candidates(self, individuals, population_node):
-        """Keep and persist exactly one strict global-best record.
+        """Append and persist each strict global-best improvement.
 
         This method is called only after an individual has been evaluated.  A
         candidate is compared with the process-wide ``_best_score``; when it
-        improves that value, ``sample_best.json`` is atomically overwritten so
-        it always describes the current best algorithm rather than a history
-        of all improvements.
+        improves that value, the record is appended and ``sample_best.json``
+        is written immediately.  It is intentionally independent of node
+        population batching.
         """
         for individual in individuals:
             self._total_sample_count += 1
@@ -147,7 +148,7 @@ class MCTSRecipe:
                 "evaluate_time": getattr(individual, "evaluate_time", None),
                 "sample_time": getattr(individual, "sample_time", None),
             }
-            self._best_samples = [best_record]
+            self._best_samples.append(best_record)
             self.store.write_best_samples(self._best_samples)
 
     def _write_node(self, node, population, recipe_id, experiences):
@@ -231,7 +232,12 @@ class MCTSRecipe:
                     depth=node.depth + 1, parent=node,
                     incoming_recipe_id=recipe_id)
                 if offspring:
-                    self._record_best_candidates(offspring, child)
+                    # Match EoH's sample-level bookkeeping: each evaluated
+                    # individual is compared with the global best and any
+                    # improvement is persisted immediately.  This is
+                    # independent of population-node batch flushing.
+                    for individual in offspring:
+                        self._record_best_candidates([individual], child)
                 node.add_child(child)
                 # One completed recipe edge is one visit to its new child and
                 # one additional visit propagated through every ancestor.

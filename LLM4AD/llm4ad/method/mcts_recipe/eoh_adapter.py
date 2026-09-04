@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import concurrent.futures
+import math
 import threading
 import time
 
@@ -167,7 +168,10 @@ class EoHRecipeExpander:
                 if self.debug_mode:
                     print(f"DEBUG: candidate evaluation failed: {exc}")
                 score, eval_time = None, None
-            if score is None:
+            if score is None or not isinstance(score, (int, float)) \
+                    or not math.isfinite(float(score)):
+                if self.debug_mode and score is not None:
+                    print(f"DEBUG: rejected non-finite evaluation score: {score}")
                 continue
             function = candidate["function"]
             function.score = score

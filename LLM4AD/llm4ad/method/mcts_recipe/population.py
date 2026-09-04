@@ -25,7 +25,7 @@ class RecipePopulation:
     def select_many(self, count):
         valid = [x for x in self.individuals
                  if getattr(x, "score", None) is not None
-                 and not math.isinf(x.score)]
+                 and math.isfinite(float(x.score))]
         if count < 1 or count > len(valid):
             raise ValueError(f"selection_num={count} exceeds population size {len(valid)}")
         valid.sort(key=lambda x: x.score, reverse=True)
@@ -35,7 +35,11 @@ class RecipePopulation:
 
     def survival(self, offspring):
         # Same direction as EoH: score is maximized (usually negative cost).
-        candidates = self.individuals + list(offspring)
+        candidates = [
+            item for item in self.individuals + list(offspring)
+            if getattr(item, "score", None) is not None
+            and math.isfinite(float(item.score))
+        ]
         candidates.sort(key=lambda x: getattr(x, "score", float("-inf")), reverse=True)
         unique, seen = [], set()
         for item in candidates:

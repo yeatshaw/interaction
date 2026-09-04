@@ -73,6 +73,8 @@ class CVRPEvaluation(Evaluation):
         heuristic = self._load_heuristic(program_source)
         costs = [self._evaluate_data(heuristic, data)
                  for data in self._datasets[:self.n_instance]]
+        if not costs:
+            return None
         if any(cost is None or not np.isfinite(cost) for cost in costs):
             return None
         return -float(np.mean(costs))

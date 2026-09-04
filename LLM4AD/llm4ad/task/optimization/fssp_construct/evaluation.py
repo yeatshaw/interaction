@@ -67,6 +67,8 @@ class FSSPEvaluation(Evaluation):
         heuristic = self._load_heuristic(program_source)
         makespans = [self._evaluate_data(heuristic, data)
                      for data in self._datasets[:self.n_instance]]
+        if not makespans:
+            return None
         if any(value is None or not np.isfinite(value) for value in makespans):
             return None
         return -float(np.mean(makespans))
