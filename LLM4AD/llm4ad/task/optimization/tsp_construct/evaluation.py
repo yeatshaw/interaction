@@ -1,194 +1,105 @@
-# Module Name: TSPEvaluation
-# Last Revision: 2025/2/16
-# Description: Evaluates the constructive heuristic for Traveling Salseman Problem (TSP).
-#              Given a set of locations,
-#              the goal is to find optimal route to travel all locations and back to start point
-#              while minimizing the total travel distance.
-#              This module is part of the LLM4AD project (https://github.com/Optima-CityU/llm4ad).
-#
-# Parameters:
-#    - timeout_seconds: Maximum allowed time (in seconds) for the evaluation process: int (default: 30).
-#    - n_instance: Number of problem instances to generate: int (default: 16).
-#    - problem_size: Number of customers to serve: int (default: 50).
-#
-# 
-# References:
-#   - Fei Liu, Xialiang Tong, Mingxuan Yuan, and Qingfu Zhang. 
-#     "Algorithm Evolution using Large Language Model." arXiv preprint arXiv:2311.15249 (2023).
-# 
-# ------------------------------- Copyright --------------------------------
-# Copyright (c) 2025 Optima Group.
-# 
-# Permission is granted to use the LLM4AD platform for research purposes. 
-# All publications, software, or other works that utilize this platform 
-# or any part of its codebase must acknowledge the use of "LLM4AD" and 
-# cite the following reference:
-# 
-# Fei Liu, Rui Zhang, Zhuoliang Xie, Rui Sun, Kai Li, Xi Lin, Zhenkun Wang, 
-# Zhichao Lu, and Qingfu Zhang, "LLM4AD: A Platform for Algorithm Design 
-# with Large Language Model," arXiv preprint arXiv:2412.17287 (2024).
-# 
-# For inquiries regarding commercial use or licensing, please contact 
-# http://www.llm4ad.com/contact.html
-# --------------------------------------------------------------------------
 from __future__ import annotations
 
 import os
 import pickle
 from pathlib import Path
 from typing import Any
-import numpy as np
-from llm4ad.base import Evaluation
-from llm4ad.task.optimization.tsp_construct.get_instance import GetData
-from llm4ad.task.optimization.tsp_construct.template import task_description
 
-__all__ = ['TSPEvaluation']
+import numpy as np
+
+from llm4ad.base import Evaluation
+from .get_instance import GetData
+
+__all__ = ["TSPEvaluation"]
+
 
 class TSPEvaluation(Evaluation):
-    """Evaluator for traveling salesman problem."""
+    """Evaluate constructive TSP heuristics by maximizing negative distance."""
 
-    def __init__(self,
-                 timeout_seconds=30,
-                 n_instance=16,
-                 problem_size=50,
-                 dataset_path: str | Path | None = None,
-                 **kwargs):
-
-        """
-            Args:
-                None
-            Raises:
-                AttributeError: If the data key does not exist.
-                FileNotFoundError: If the specified data file is not found.
-        """
-
-        super().__init__(
-            use_numba_accelerate=False,
-            timeout_seconds=timeout_seconds
-        )
-
-        dataset_path = dataset_path or os.environ.get('LLM4AD_TSP_TRAIN_DATA')
+    def __init__(self, timeout_seconds=30, n_instance=50, problem_size=100,
+                 dataset_path: str | Path | None = None, seed=2024, **kwargs):
+        super().__init__(use_numba_accelerate=False,
+                         timeout_seconds=timeout_seconds)
+        dataset_path = dataset_path or os.environ.get("LLM4AD_TSP_TRAIN_DATA")
         if dataset_path:
-            with Path(dataset_path).expanduser().open('rb') as file:
-                self._datasets = pickle.load(file)
-            if not isinstance(self._datasets, (list, tuple)) or not self._datasets:
-                raise ValueError('TSP dataset must be a non-empty list of instance pairs.')
-            self.n_instance = len(self._datasets)
-            self.problem_size = len(self._datasets[0][0])
+            with Path(dataset_path).expanduser().open("rb") as file:
+                datasets = pickle.load(file)
         else:
-            self.n_instance = n_instance
-            self.problem_size = problem_size
-            getData = GetData(self.n_instance, self.problem_size)
-            self._datasets = getData.generate_instances()
+            datasets = GetData(n_instance, problem_size, seed=seed).generate_instances()
 
-    def evaluate_program(self, program_str: str, callable_func: callable) -> Any | None:
+        self._datasets = self._validate_datasets(datasets)
+        self.n_instance = len(self._datasets)
+        self.problem_size = len(self._datasets[0][0])
+
+    @staticmethod
+    def _validate_datasets(datasets):
+        if not isinstance(datasets, (list, tuple)) or not datasets:
+            raise ValueError("TSP dataset must be a non-empty list of instance pairs.")
+        validated = []
+        for index, item in enumerate(datasets):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError(
+                    f"TSP instance {index} must be (coordinates, distance_matrix).")
+            coordinates = np.asarray(item[0], dtype=float)
+            distance_matrix = np.asarray(item[1], dtype=float)
+            city_count = len(coordinates)
+            if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+                raise ValueError(f"TSP instance {index} coordinates must have shape [n, 2].")
+            if city_count < 2 or distance_matrix.shape != (city_count, city_count):
+                raise ValueError(
+                    f"TSP instance {index} has an invalid distance matrix shape.")
+            if not np.all(np.isfinite(coordinates)) or not np.all(np.isfinite(distance_matrix)):
+                raise ValueError(f"TSP instance {index} contains non-finite values.")
+            validated.append((coordinates, distance_matrix))
+        return validated
+
+    @staticmethod
+    def _load_heuristic(function_source):
+        namespace = {"np": np}
+        exec(function_source, namespace)
+        heuristic = namespace.get("select_next_node")
+        if not callable(heuristic):
+            raise ValueError("Program does not define callable select_next_node.")
+        return heuristic
+
+    @staticmethod
+    def _evaluate_data(heuristic, data):
+        coordinates, distance_matrix = data
+        city_count = len(coordinates)
+        route = [0]
+        unvisited = set(range(1, city_count))
+        current_node = 0
+
+        while unvisited:
+            candidates = np.asarray(sorted(unvisited), dtype=int)
+            try:
+                next_node = int(heuristic(
+                    current_node, 0, candidates.copy(), distance_matrix.copy()))
+            except (TypeError, ValueError, IndexError, OverflowError):
+                return None
+            if next_node not in unvisited:
+                return None
+            route.append(next_node)
+            unvisited.remove(next_node)
+            current_node = next_node
+
+        route.append(0)
+        distance = sum(distance_matrix[a, b] for a, b in zip(route, route[1:]))
+        return float(distance) if np.isfinite(distance) else None
+
+    def evaluate_instance(self, function_source, data):
+        """Return one instance's route distance for final test reporting."""
+        return self._evaluate_data(self._load_heuristic(function_source), data)
+
+    def evaluate_program(self, program_str: str,
+                         callable_func: callable) -> Any | None:
         return self.evaluate(callable_func)
 
-    def tour_cost(self, instance, solution, problem_size):
-        cost = 0
-        for j in range(problem_size - 1):
-            cost += np.linalg.norm(instance[int(solution[j])] - instance[int(solution[j + 1])])
-        cost += np.linalg.norm(instance[int(solution[-1])] - instance[int(solution[0])])
-        return cost
-
-    def generate_neighborhood_matrix(self, instance):
-        instance = np.array(instance)
-        n = len(instance)
-        neighborhood_matrix = np.zeros((n, n), dtype=int)
-
-        for i in range(n):
-            distances = np.linalg.norm(instance[i] - instance, axis=1)
-            sorted_indices = np.argsort(distances)  # sort indices based on distances
-            neighborhood_matrix[i] = sorted_indices
-
-        return neighborhood_matrix
-
-    def evaluate(self, eva: callable) -> float:
-
-        n_max = self.n_instance
-        dis = np.ones(self.n_instance)
-        n_ins = 0
-
-        for instance, distance_matrix in self._datasets:
-
-            # get neighborhood matrix
-            neighbor_matrix = self.generate_neighborhood_matrix(instance)
-
-            destination_node = 0
-
-            current_node = 0
-
-            route = np.zeros(self.problem_size)
-            # print(">>> Step 0 : select node "+str(instance[0][0])+", "+str(instance[0][1]))
-            for i in range(1, self.problem_size - 1):
-
-                near_nodes = neighbor_matrix[current_node][1:]
-
-                mask = ~np.isin(near_nodes, route[:i])
-
-                unvisited_near_nodes = near_nodes[mask]
-
-                next_node = eva(current_node, destination_node, unvisited_near_nodes, distance_matrix)
-
-                if next_node in route:
-                    # print("wrong algorithm select duplicate node, retrying ...")
-                    return None
-
-                current_node = next_node
-
-                route[i] = current_node
-
-            mask = ~np.isin(np.arange(self.problem_size), route[:self.problem_size - 1])
-
-            last_node = np.arange(self.problem_size)[mask]
-
-            current_node = last_node[0]
-
-            route[self.problem_size - 1] = current_node
-
-            LLM_dis = self.tour_cost(instance, route, self.problem_size)
-
-            dis[n_ins] = LLM_dis
-
-            n_ins += 1
-            if n_ins == self.n_instance:
-                break
-            # self.route_plot(instance,route,self.oracle[n_ins])
-
-        ave_dis = np.average(dis)
-        # print("average dis: ",ave_dis)
-        return -ave_dis
-
-
-if __name__ == '__main__':
-    import sys
-
-    print(sys.path)
-
-
-    def select_next_node(current_node: int, destination_node: int, unvisited_nodes: np.ndarray, distance_matrix: np.ndarray) -> int:
-        """
-        Design a novel algorithm to select the next node in each step.
-
-        Args:
-        current_node: ID of the current node.
-        destination_node: ID of the destination node.
-        unvisited_nodes: Array of IDs of unvisited nodes.
-        distance_matrix: Distance matrix of nodes.
-
-        Return:
-        ID of the next node to visit.
-        """
-        distances_to_destination = distance_matrix[current_node][unvisited_nodes]
-
-        # Find the index of the unvisited node with the smallest distance to the destination
-        next_node_index = np.argmin(distances_to_destination)
-
-        # Get the ID of the next node to visit
-        next_node = unvisited_nodes[next_node_index]
-
-        return next_node
-
-
-    tsp = TSPEvaluation()
-    tsp.evaluate_program('_', select_next_node)
+    def evaluate(self, heuristic):
+        if not callable(heuristic):
+            heuristic = self._load_heuristic(str(heuristic))
+        distances = [self._evaluate_data(heuristic, data)
+                     for data in self._datasets]
+        if not distances or any(value is None for value in distances):
+            return None
+        return -float(np.mean(distances))

@@ -90,7 +90,7 @@ class MCTSRecipe:
             if np is not None:
                 np.random.seed(seed)
 
-    def initialize(self, individuals):
+    def initialize(self, individuals, initial_samples_recorded=False):
         population = RecipePopulation(copy.deepcopy(individuals), self.pop_size)
         if not population.individuals:
             raise ValueError("initial population cannot be empty")
@@ -100,7 +100,8 @@ class MCTSRecipe:
         self._next_population_node_id += 1
         root = RecipeNode(root_id, best, depth=0)
         self.tree.root = root
-        self._record_best_candidates(population.individuals, root)
+        if not initial_samples_recorded:
+            self._record_best_candidates(population.individuals, root)
         self._write_node(root, population, None, [])
         # Persist the root once immediately. Subsequent nodes use batching.
         if self.store.flush() is not None:
@@ -109,10 +110,36 @@ class MCTSRecipe:
         return root
 
     def _assign_algorithm_ids(self, individuals):
-        for item in individuals:
-            if getattr(item, "_recipe_algorithm_id", None) is None:
-                item._recipe_algorithm_id = self._next_algorithm_id
-                self._next_algorithm_id += 1
+        with self._tree_lock:
+            for item in individuals:
+                if getattr(item, "_recipe_algorithm_id", None) is None:
+                    item._recipe_algorithm_id = self._next_algorithm_id
+                    self._next_algorithm_id += 1
+
+    def reserve_sample_order(self):
+        """Reserve one EoH-style sampling attempt before generation starts.
+
+        The order counts calls to i1/e1/e2/m1/m2, including invalid code or
+        failed evaluations.  It is intentionally independent of feasible
+        algorithm IDs.
+        """
+        with self._tree_lock:
+            self._total_sample_count += 1
+            return self._total_sample_count
+
+    def record_evaluated_sample(self, individual, population_node_id, depth):
+        """Register one completed evaluation immediately and atomically.
+
+        This is deliberately called by the thread receiving an evaluation
+        future, rather than after a recipe batch or node is persisted.
+        """
+        with self._tree_lock:
+            self._assign_algorithm_ids([individual])
+            context = type("SampleContext", (), {
+                "population_node_id": int(population_node_id),
+                "depth": int(depth),
+            })()
+            self._record_best_candidates([individual], context)
 
     def _record_best_candidates(self, individuals, population_node):
         """Append and persist each strict global-best improvement.
@@ -123,33 +150,34 @@ class MCTSRecipe:
         is written immediately.  It is intentionally independent of node
         population batching.
         """
-        for individual in individuals:
-            self._total_sample_count += 1
-            score = getattr(individual, "score", None)
-            if score is None or score <= self._best_score:
-                continue
-            code = (individual.to_code_without_docstring()
-                    if hasattr(individual, "to_code_without_docstring")
-                    else str(individual))
-            self._best_score = float(score)
-            best_record = {
-                "sample_order": self._total_sample_count,
-                "algorithm_id": getattr(individual, "_recipe_algorithm_id", None),
-                "population_node_id": population_node.population_node_id,
-                "depth": population_node.depth,
-                "recipe_id": getattr(individual, "_recipe_id", None),
-                "operator": getattr(individual, "operator", None),
-                "parent_algorithm_ids": list(
-                    getattr(individual, "_eoh_parent_ids", ())),
-                "algorithm": getattr(individual, "algorithm", ""),
-                "function": code,
-                "program": code,
-                "score": score,
-                "evaluate_time": getattr(individual, "evaluate_time", None),
-                "sample_time": getattr(individual, "sample_time", None),
-            }
-            self._best_samples.append(best_record)
-            self.store.write_best_samples(self._best_samples)
+        with self._tree_lock:
+            for individual in individuals:
+                score = getattr(individual, "score", None)
+                if score is None or score <= self._best_score:
+                    continue
+                code = (individual.to_code_without_docstring()
+                        if hasattr(individual, "to_code_without_docstring")
+                        else str(individual))
+                self._best_score = float(score)
+                best_record = {
+                    "sample_order": getattr(
+                        individual, "_recipe_sample_order", None),
+                    "algorithm_id": getattr(individual, "_recipe_algorithm_id", None),
+                    "population_node_id": population_node.population_node_id,
+                    "depth": population_node.depth,
+                    "recipe_id": getattr(individual, "_recipe_id", None),
+                    "operator": getattr(individual, "operator", None),
+                    "parent_algorithm_ids": list(
+                        getattr(individual, "_eoh_parent_ids", ())),
+                    "algorithm": getattr(individual, "algorithm", ""),
+                    "function": code,
+                    "program": code,
+                    "score": score,
+                    "evaluate_time": getattr(individual, "evaluate_time", None),
+                    "sample_time": getattr(individual, "sample_time", None),
+                }
+                self._best_samples.append(best_record)
+                self.store.write_best_samples(self._best_samples)
 
     def _write_node(self, node, population, recipe_id, experiences):
         flushed = self.store.add(
@@ -202,18 +230,32 @@ class MCTSRecipe:
                 f"Population node {node.population_node_id} is already fully expanded")
         children = []
 
+        with self._tree_lock:
+            child_ids = {
+                recipe_id: self._next_population_node_id + index
+                for index, (recipe_id, _) in enumerate(pending_recipes)
+            }
+            self._next_population_node_id += len(pending_recipes)
+
         def expand_recipe(recipe_id, recipe):
             branch_experiences = copy.deepcopy(list(experiences or []))
             branch_population = population.clone()
             expander = (self.expand_fn[recipe_id]
                         if isinstance(self.expand_fn, dict) else self.expand_fn)
+            sample_callback = lambda individual: self.record_evaluated_sample(
+                individual, child_ids[recipe_id], node.depth + 1)
+            sample_order_callback = self.reserve_sample_order
             if recipe.values.get("refineevo_experience", False):
                 result = expander(
                     branch_population, recipe, self.selection_num,
-                    self.pop_size, experiences=branch_experiences)
+                    self.pop_size, experiences=branch_experiences,
+                    on_evaluated=sample_callback,
+                    reserve_sample_order=sample_order_callback)
             else:
                 result = expander(
-                    branch_population, recipe, self.selection_num, self.pop_size)
+                    branch_population, recipe, self.selection_num, self.pop_size,
+                    on_evaluated=sample_callback,
+                    reserve_sample_order=sample_order_callback)
             if isinstance(result, tuple):
                 offspring, new_experiences = result
             else:
@@ -224,20 +266,12 @@ class MCTSRecipe:
                     child_population = branch_population.survival(offspring)
                 else:
                     child_population = branch_population.inherited_next_generation()
-                child_id = self._next_population_node_id
-                self._next_population_node_id += 1
+                child_id = child_ids[recipe_id]
                 child = RecipeNode(
                     child_id,
                     max(x.score for x in child_population.individuals),
                     depth=node.depth + 1, parent=node,
                     incoming_recipe_id=recipe_id)
-                if offspring:
-                    # Match EoH's sample-level bookkeeping: each evaluated
-                    # individual is compared with the global best and any
-                    # improvement is persisted immediately.  This is
-                    # independent of population-node batch flushing.
-                    for individual in offspring:
-                        self._record_best_candidates([individual], child)
                 node.add_child(child)
                 # One completed recipe edge is one visit to its new child and
                 # one additional visit propagated through every ancestor.
@@ -255,7 +289,8 @@ class MCTSRecipe:
                 future.result()
         return children
 
-    def run(self, initial_individuals=None, checkpoint=None):
+    def run(self, initial_individuals=None, checkpoint=None,
+            initial_samples_recorded=False):
         if checkpoint is not None:
             self.restore(checkpoint)
         else:
@@ -265,7 +300,7 @@ class MCTSRecipe:
                 raise FileExistsError(
                     f"{self.store.directory} already contains population nodes; "
                     "use a new LLM4AD_LOG_DIR or set LLM4AD_CHECKPOINT")
-            self.initialize(initial_individuals)
+            self.initialize(initial_individuals, initial_samples_recorded)
         while True:
             node = self.tree.select()
             if node.depth >= self.max_depth:

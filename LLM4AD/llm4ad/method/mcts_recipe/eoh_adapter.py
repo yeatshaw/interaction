@@ -30,10 +30,9 @@ class EoHRecipeExpander:
                                          **evaluator_kwargs)
         self.num_samplers = max(1, int(num_samplers))
         self.num_evaluators = max(1, int(num_evaluators))
-        # Sampling and evaluation are deliberately separate pools.  A sampling
-        # worker never waits for evaluation; the whole generated batch is
-        # submitted to ``evaluation_executor`` after all sampling futures have
-        # completed.
+        # Sampling and evaluation use separate pools. Each sampling worker runs
+        # an EoH-style pipeline and waits only for its own evaluation before it
+        # decides whether another sample is still needed.
         self.sampler_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.num_samplers)
         self.evaluation_executor = concurrent.futures.ThreadPoolExecutor(
@@ -104,13 +103,16 @@ class EoHRecipeExpander:
             prompt = EoHPrompt.get_prompt_m2(refs[0], self.info, suggestion)
         return prompt
 
-    def _prepare_candidate(self, refs, population, recipe, operator):
+    def _prepare_candidate(self, refs, population, recipe, operator,
+                           reserve_sample_order=None):
         """Perform reflection and LLM/code generation, but do not evaluate.
 
         The returned dictionary is intentionally independent of evaluation so
         many of these tasks can be generated concurrently and then evaluated
         as one batch.
         """
+        sample_order = (reserve_sample_order()
+                        if reserve_sample_order is not None else None)
         sample_start = time.time()
         try:
             # Front-loaded reflection. References without lineage parents use
@@ -136,6 +138,7 @@ class EoHRecipeExpander:
         function._eoh_parent_ids = tuple(
             getattr(ref, "_recipe_algorithm_id", None) for ref in refs)
         function._recipe_id = recipe.recipe_id
+        function._recipe_sample_order = sample_order
         function._eoh_generation_suggestion = suggestion
         return {
             "function": function,
@@ -146,7 +149,7 @@ class EoHRecipeExpander:
             "sample_time": sample_time,
         }
 
-    def _evaluate_candidates(self, candidates):
+    def _evaluate_candidates(self, candidates, on_evaluated=None):
         """Evaluate a prepared batch concurrently and return feasible entries."""
         if not candidates:
             return []
@@ -157,7 +160,8 @@ class EoHRecipeExpander:
             for candidate in candidates
         }
         evaluated = []
-        for future, candidate in futures.items():
+        for future in concurrent.futures.as_completed(futures):
+            candidate = futures[future]
             try:
                 result = future.result()
                 if not isinstance(result, tuple) or len(result) != 2:
@@ -176,7 +180,48 @@ class EoHRecipeExpander:
             function = candidate["function"]
             function.score = score
             function.evaluate_time = eval_time
+            if on_evaluated is not None:
+                try:
+                    on_evaluated(function)
+                except Exception as exc:
+                    if self.debug_mode:
+                        print(f"DEBUG: sample-best registration failed: {exc}")
             evaluated.append(candidate)
+        return evaluated
+
+    def _collect_until_target(self, prepare_one, target_size,
+                              on_evaluated=None):
+        """Run concurrent sample/evaluate pipelines until enough are feasible.
+
+        Once the shared feasible count reaches ``target_size``, no worker
+        starts another sample. Work that was already sampling or evaluating is
+        allowed to finish, and every additional feasible result is returned so
+        it can participate in population survival.
+        """
+        target_size = int(target_size)
+        if target_size < 1:
+            return []
+        evaluated = []
+        result_lock = threading.RLock()
+
+        def worker():
+            while True:
+                with result_lock:
+                    if len(evaluated) >= target_size:
+                        return
+                candidate = prepare_one()
+                if candidate is None:
+                    continue
+                result = self._evaluate_candidates(
+                    [candidate], on_evaluated=on_evaluated)
+                if result:
+                    with result_lock:
+                        evaluated.extend(result)
+
+        futures = [self.sampler_executor.submit(worker)
+                   for _ in range(self.num_samplers)]
+        for future in futures:
+            future.result()
         return evaluated
 
     def _generate(self, refs, population, recipe, operator):
@@ -189,14 +234,17 @@ class EoHRecipeExpander:
         function = evaluated[0]["function"]
         return function
 
-    def __call__(self, population, recipe, selection_num, target_size):
+    def __call__(self, population, recipe, selection_num, target_size,
+                 on_evaluated=None, reserve_sample_order=None):
         operators = ("e1", "e2", "m1", "m2")
-        # Keep a bad/invalid LLM response from spinning forever.  This is the
-        # same two-sample-per-slot budget used by EoH initialization; a short
-        # batch simply causes the MCTS caller to inherit the parent population.
-        max_attempts = max(int(target_size) * 2, int(target_size))
-        specs = []
-        for index in range(max_attempts):
+        schedule_lock = threading.Lock()
+        next_operator_index = 0
+
+        def prepare_one():
+            nonlocal next_operator_index
+            with schedule_lock:
+                index = next_operator_index
+                next_operator_index += 1
             operator = operators[index % len(operators)]
             try:
                 count = selection_num if operator in ("e1", "e2") else 1
@@ -204,21 +252,18 @@ class EoHRecipeExpander:
             except Exception as exc:
                 if self.debug_mode:
                     print(f"DEBUG: reference selection failed: {exc}")
-                refs = None
-            if refs:
-                specs.append((refs, population, recipe, operator))
+                return None
+            return self._prepare_candidate(
+                refs, population, recipe, operator,
+                reserve_sample_order=reserve_sample_order)
 
-        # Node-level barrier: every LLM/code-generation future completes
-        # before the first evaluation future is submitted.
-        prepared = list(self.sampler_executor.map(
-            lambda spec: self._prepare_candidate(*spec), specs))
-        evaluated = self._evaluate_candidates(
-            [candidate for candidate in prepared if candidate is not None])
-        offspring = [candidate["function"] for candidate in evaluated[:target_size]]
+        evaluated = self._collect_until_target(
+            prepare_one, target_size, on_evaluated=on_evaluated)
+        offspring = [candidate["function"] for candidate in evaluated]
         if len(offspring) < target_size and self.debug_mode:
             print(f"DEBUG: recipe {recipe.recipe_id} produced "
                   f"{len(offspring)}/{target_size} feasible candidates "
-                  f"after {len(specs)} attempts")
+                  f"before its workers stopped")
         return offspring
 
     def _generate_without_reflection(self, refs, recipe, operator="e1"):
@@ -286,7 +331,8 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
         return function, operator
 
     def _prepare_experience_candidate(self, refs, recipe, operator,
-                                      parent_experiences):
+                                      parent_experiences,
+                                      reserve_sample_order=None):
         """Retrieve/distill experience and generate one candidate.
 
         This is the sampling phase of RefineEvo.  Distillation may itself call
@@ -294,6 +340,8 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
         started until every candidate in the batch has reached this method's
         return point.
         """
+        sample_order = (reserve_sample_order()
+                        if reserve_sample_order is not None else None)
         sample_start = time.time()
         try:
             retrieved = (self.retrieve_experiences(
@@ -326,6 +374,7 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
         function.sample_time = sample_time
         function.operator = operator
         function._recipe_id = recipe.recipe_id
+        function._recipe_sample_order = sample_order
         function._eoh_parent_ids = tuple(
             getattr(ref, "_recipe_algorithm_id", None) for ref in refs)
         # Preserve the experience actually supplied to the operator on the
@@ -343,22 +392,28 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
         }
 
     def __call__(self, population, recipe, selection_num, target_size,
-                 experiences=None):
+                 experiences=None, on_evaluated=None,
+                 reserve_sample_order=None):
         parent_experiences = list(experiences or [])
         experience_lock = threading.RLock()
         manager = getattr(self.retrieve_experiences, "__self__", None)
         if manager is not None and hasattr(manager, "begin_node"):
             manager.begin_node(parent_experiences)
         operators = ("e1", "e2", "m1", "m2")
-        max_attempts = max(int(target_size) * 2, int(target_size))
 
         try:
             # Freeze one node-local experience snapshot for the complete
             # generation phase.  No evaluation or score update happens yet.
             with experience_lock:
                 experience_snapshot = copy.deepcopy(parent_experiences)
-            specs = []
-            for index in range(max_attempts):
+            schedule_lock = threading.Lock()
+            next_operator_index = 0
+
+            def prepare_one():
+                nonlocal next_operator_index
+                with schedule_lock:
+                    index = next_operator_index
+                    next_operator_index += 1
                 operator = operators[index % len(operators)]
                 try:
                     count = selection_num if operator in ("e1", "e2") else 1
@@ -366,19 +421,19 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
                 except Exception as exc:
                     if self.debug_mode:
                         print(f"DEBUG: reference selection failed: {exc}")
-                    refs = None
-                if refs:
-                    specs.append((refs, recipe, operator, experience_snapshot))
-            prepared = list(self.sampler_executor.map(
-                lambda spec: self._prepare_experience_candidate(*spec), specs))
-            evaluated = self._evaluate_candidates(
-                [candidate for candidate in prepared if candidate is not None])
+                    return None
+                return self._prepare_experience_candidate(
+                    refs, recipe, operator, experience_snapshot,
+                    reserve_sample_order=reserve_sample_order)
+
+            evaluated = self._collect_until_target(
+                prepare_one, target_size, on_evaluated=on_evaluated)
 
             # The node-local experience pool is mutated only after the whole
             # candidate batch has been evaluated.
             offspring, new_experiences = [], []
             with experience_lock:
-                for candidate in evaluated[:target_size]:
+                for candidate in evaluated:
                     child = candidate["function"]
                     refs = candidate["refs"]
                     retrieved = candidate["retrieved"]
@@ -409,7 +464,7 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
         if len(offspring) < target_size and self.debug_mode:
             print(f"DEBUG: recipe {recipe.recipe_id} produced "
                   f"{len(offspring)}/{target_size} feasible candidates "
-                  f"after {len(specs)} attempts")
+                  f"before its workers stopped")
         return offspring, new_experiences
 
     def _generate_with_experience(self, refs, recipe, experience_text,

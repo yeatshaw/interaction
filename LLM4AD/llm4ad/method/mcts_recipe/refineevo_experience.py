@@ -40,7 +40,13 @@ class RefineEvoExperienceManager:
             self._node_embedding_cache = {}
         if not items:
             return
-        vectors = self._encode_many([x["query"] for x in items])
+        try:
+            vectors = self._encode_many([x["query"] for x in items])
+        except Exception:
+            # Embedding is an optional retrieval enhancement.  A temporary
+            # authentication/network failure must not abort the MCTS run;
+            # retrieve() will use a deterministic non-vector fallback.
+            return
         with self._cache_lock:
             self._node_embedding_cache = {
                 item["experience_id"]: vectors[index]
@@ -65,13 +71,20 @@ class RefineEvoExperienceManager:
                       and x.get("query")]
         if not candidates:
             return []
-        query_vector = np.asarray(
-            self.embedding_model.encode(self.build_query(refs, operator)), dtype=float)
+        try:
+            query_vector = np.asarray(
+                self.embedding_model.encode(self.build_query(refs, operator)),
+                dtype=float)
+        except Exception:
+            return candidates[:self.top_k]
         with self._cache_lock:
             missing = [x for x in candidates
                        if x["experience_id"] not in self._node_embedding_cache]
         if missing:
-            vectors = self._encode_many([x["query"] for x in missing])
+            try:
+                vectors = self._encode_many([x["query"] for x in missing])
+            except Exception:
+                return candidates[:self.top_k]
             with self._cache_lock:
                 self._node_embedding_cache.update({
                     item["experience_id"]: vectors[index]

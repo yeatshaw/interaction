@@ -66,7 +66,8 @@ def _int_env(name, default):
 
 
 def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
-                        num_samplers=1, debug=False):
+                        num_samplers=1, debug=False, on_evaluated=None,
+                        reserve_sample_order=None):
     """Generate and evaluate the root population with the EoH i1 prompt."""
     sampler = EoHSampler(llm, info["template_program"])
     evaluator = SecureEvaluator(evaluation, debug_mode=debug)
@@ -75,6 +76,8 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
     max_attempts = pop_size * 2
 
     def sample_one():
+        sample_order = (reserve_sample_order()
+                        if reserve_sample_order is not None else None)
         sample_start = time.time()
         thought, function = sampler.get_thought_and_function(prompt)
         sample_time = time.time() - sample_start
@@ -95,6 +98,9 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
         function.evaluate_time = eval_time
         function.sample_time = sample_time
         function.operator = "i1"
+        function._recipe_sample_order = sample_order
+        if on_evaluated is not None:
+            on_evaluated(function)
         return function
 
     attempts = 0
@@ -130,19 +136,17 @@ def run_task(*, method_name, template_module, evaluation, llm,
     store_dir = Path(store_dir).resolve()
     store_dir.mkdir(parents=True, exist_ok=True)
     print(f"Recipe-MCTS output directory: {store_dir}", flush=True)
-    initial = (None if checkpoint else
-               _initial_population(llm, evaluation, info, pop_size,
-                                   selection_num, num_samplers, debug))
     recipes = get_default_recipes()
     embedding_host = os.environ.get(
         "LLM4AD_EMBEDDING_BASE_URL",
-        f"https://{os.environ.get('LLM4AD_API_HOST', 'api.apilio.ai')}/v1")
+        "https://dashscope.aliyuncs.com/compatible-mode/v1")
     embedding = OpenAIEmbedding(
         api_key=os.environ.get("LLM4AD_EMBEDDING_API_KEY",
-                               os.environ.get("LLM4AD_API_KEY", "")),
+                               os.environ.get("OPENAI_API_KEY8",
+                                              os.environ.get("LLM4AD_API_KEY", ""))),
         base_url=embedding_host,
         model=os.environ.get(
-            "LLM4AD_EMBEDDING_MODEL", "text-embedding-3-small"),
+            "LLM4AD_EMBEDDING_MODEL", "text-embedding-v4"),
         encoding_format=os.environ.get(
             "LLM4AD_EMBEDDING_ENCODING_FORMAT", "float"),
     )
@@ -184,7 +188,24 @@ def run_task(*, method_name, template_module, evaluation, llm,
               if "LLM4AD_SEED" in os.environ else None),
     )
     try:
-        return method.run(initial_individuals=initial, checkpoint=checkpoint)
+        if checkpoint:
+            initial = None
+        else:
+            # Construct the recorder before sampling so every evaluated root
+            # candidate can update sample_best.json immediately.
+            initial = _initial_population(
+                llm, evaluation, info, pop_size, selection_num,
+                num_samplers, debug,
+                on_evaluated=lambda function: method.record_evaluated_sample(
+                    function, population_node_id=1, depth=0),
+                reserve_sample_order=method.reserve_sample_order,
+            )
+        return method.run(
+            initial_individuals=initial,
+            checkpoint=checkpoint,
+            # Root samples were already recorded by the callback above.
+            initial_samples_recorded=(checkpoint is None),
+        )
     finally:
         for expander in expanders.values():
             expander.close(close_llm=False)
@@ -196,15 +217,16 @@ def common_options(default_log):
     repository_root = Path(__file__).resolve().parents[2]
     store_dir = (Path(configured_log) if configured_log
                  else repository_root / default_log)
+    pop_size = _int_env("LLM4AD_POP_SIZE", 10)
     return {
         "store_dir": store_dir,
-        "pop_size": _int_env("LLM4AD_POP_SIZE", 10),
+        "pop_size": pop_size,
         "selection_num": _int_env("LLM4AD_SELECTION_NUM", 2),
         "max_depth": _int_env("LLM4AD_MAX_DEPTH", 50),
-        "num_samplers": _int_env("LLM4AD_NUM_SAMPLERS", 10),
-        # Keep generation and evaluation parallel by default.  Set this to a
-        # smaller value on machines where each safe evaluation starts a child
-        # process or the task itself uses many CPU threads.
-        "num_evaluators": _int_env("LLM4AD_NUM_EVALUATORS", 10),
+        # Match EoH-style generation by default: one concurrent sampler and
+        # evaluator pipeline per population slot. Both values remain
+        # independently configurable for resource-constrained machines.
+        "num_samplers": _int_env("LLM4AD_NUM_SAMPLERS", pop_size),
+        "num_evaluators": _int_env("LLM4AD_NUM_EVALUATORS", pop_size),
         "debug": os.environ.get("LLM4AD_DEBUG", "0") == "1",
     }
