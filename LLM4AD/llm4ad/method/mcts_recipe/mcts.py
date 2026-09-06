@@ -86,13 +86,27 @@ class RecipeMCTS:
                 node = max(node.children, key=self.uct)
             return node
 
-        depth_visits = {}
-        for item in candidates:
-            depth_visits[item.depth] = depth_visits.get(item.depth, 0) + max(item.visits, 1)
-        total = sum(depth_visits.values())
+        # ``visits`` cannot be used for this balance term in this tree design:
+        # an expandable node has visits=1, and after expansion it becomes
+        # non-expandable with visits=len(recipes)+1. Count generated nodes at
+        # each depth instead, including nodes that have already been expanded.
+        depth_counts = {}
+        stack = [self.root]
+        while stack:
+            item = stack.pop()
+            depth_counts[item.depth] = depth_counts.get(item.depth, 0) + 1
+            stack.extend(item.children)
+        max_count = max(depth_counts.values())
+        deepest_frontier = max(item.depth for item in candidates)
         balance = {
-            depth: math.sqrt(math.log(total + 1.0) / count)
-            for depth, count in depth_visits.items()
+            # Underrepresented depths get a larger reward. The second term
+            # mildly prefers the deepest currently available frontier, so the
+            # search can continue down a path when shallow depths are already
+            # much wider than deep ones.
+            depth: ((max_count - depth_counts.get(depth, 0)) /
+                    (max_count + 1.0) +
+                    0.25 * depth / max(deepest_frontier, 1))
+            for depth in {item.depth for item in candidates}
         }
         return max(
             candidates,
@@ -103,6 +117,9 @@ class RecipeMCTS:
     def backpropagate(self, node):
         child = node
         while child.parent is not None:
+            # Count the selected node as well as every ancestor. Without this
+            # increment, all non-root nodes remain at visits=1 forever.
+            child.visits += 1
             parent = child.parent
             parent.Q = max(parent.Q, child.Q)
             parent.visits += 1
