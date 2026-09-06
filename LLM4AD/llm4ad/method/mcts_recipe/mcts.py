@@ -25,10 +25,14 @@ class RecipeNode:
 
 
 class RecipeMCTS:
-    def __init__(self, recipes, exploration_constant=0.1, max_depth=50):
+    def __init__(self, recipes, exploration_constant=0.1, max_depth=50,
+                 depth_balance_weight=0.0):
         self.recipes = dict(recipes)
         self.exploration_constant = float(exploration_constant)
         self.max_depth = int(max_depth)
+        # Rewards depths that have received fewer visits. This is deliberately
+        # separate from UCT's score and child-level exploration terms.
+        self.depth_balance_weight = float(depth_balance_weight)
         self.root = None
 
     @staticmethod
@@ -48,14 +52,53 @@ class RecipeMCTS:
             math.log(node.parent.visits + 1.0) / max(node.visits, 1))
         return exploit + explore
 
-    def select(self):
-        """Select a leaf by UCT; every selected leaf is expanded only once."""
-        node = self.root
-        while node.children and node.depth < self.max_depth:
+    def _expandable_nodes(self):
+        """Return all frontier nodes that can still expand a recipe."""
+        if self.root is None:
+            return []
+        result = []
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            if node.depth >= self.max_depth:
+                continue
             if len(node.expanded_recipe_ids) < len(self.recipes):
-                return node
-            node = max(node.children, key=self.uct)
-        return node
+                result.append(node)
+            stack.extend(node.children)
+        return result
+
+    def select(self):
+        """Select an expandable node using UCT plus depth balancing.
+
+        UCT remains the main value signal. The optional balance term compares
+        frontier coverage across depths, so a heavily explored depth does not
+        monopolize selection when another depth has fewer visits.
+        """
+        candidates = self._expandable_nodes()
+        if not candidates:
+            return self.root
+        if self.depth_balance_weight == 0.0:
+            # Preserve the original root-to-leaf UCT behavior by default.
+            node = self.root
+            while node.children and node.depth < self.max_depth:
+                if len(node.expanded_recipe_ids) < len(self.recipes):
+                    return node
+                node = max(node.children, key=self.uct)
+            return node
+
+        depth_visits = {}
+        for item in candidates:
+            depth_visits[item.depth] = depth_visits.get(item.depth, 0) + max(item.visits, 1)
+        total = sum(depth_visits.values())
+        balance = {
+            depth: math.sqrt(math.log(total + 1.0) / count)
+            for depth, count in depth_visits.items()
+        }
+        return max(
+            candidates,
+            key=lambda item: self.uct(item) +
+            self.depth_balance_weight * balance[item.depth],
+        )
 
     def backpropagate(self, node):
         child = node

@@ -45,6 +45,7 @@ class MCTSRecipe:
 
     def __init__(self, recipes, pop_size=10, selection_num=2,
                  max_depth=50, exploration_constant=0.1,
+                 depth_balance_weight=0.0,
                  node_batch_size=10, store_dir="recipe_mcts",
                  expand_fn=None, seed=None):
         recipes = validate_recipes(recipes)
@@ -58,7 +59,10 @@ class MCTSRecipe:
         self.expand_fn = expand_fn
         # UNCERTAIN: the exact recipe definitions and EoH integration callback
         # are deliberately supplied by the task runner, not hard-coded here.
-        self.tree = RecipeMCTS(self.recipes, exploration_constant, max_depth)
+        self.depth_balance_weight = float(depth_balance_weight)
+        self.tree = RecipeMCTS(
+            self.recipes, exploration_constant, max_depth,
+            depth_balance_weight=self.depth_balance_weight)
         self.store = RecipeStore(store_dir, node_batch_size)
         self._next_population_node_id = 1
         self._next_algorithm_id = 1
@@ -335,6 +339,9 @@ class MCTSRecipe:
         self.tree.max_depth = self.max_depth
         if "exploration_constant" in state:
             self.tree.exploration_constant = float(state["exploration_constant"])
+        self.depth_balance_weight = float(state.get(
+            "depth_balance_weight", state.get("depth_bias", self.depth_balance_weight)))
+        self.tree.depth_balance_weight = self.depth_balance_weight
         root, _ = restore_tree(state)
         if root is None:
             raise ValueError("checkpoint does not contain a root node")
@@ -382,6 +389,7 @@ class MCTSRecipe:
             "pop_size": self.pop_size,
             "selection_num": self.selection_num,
             "exploration_constant": self.tree.exploration_constant,
+            "depth_balance_weight": self.tree.depth_balance_weight,
             "nodes": nodes,
             "recipes": {k: v.values for k, v in self.recipes.items()},
             # Pickled/base64 states preserve exact Python and NumPy RNG state;

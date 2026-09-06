@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -73,9 +74,16 @@ class TSPEvaluation(Evaluation):
         while unvisited:
             candidates = np.asarray(sorted(unvisited), dtype=int)
             try:
-                next_node = int(heuristic(
-                    current_node, 0, candidates.copy(), distance_matrix.copy()))
-            except (TypeError, ValueError, IndexError, OverflowError):
+                # Invalid generated heuristics often take the mean of an empty
+                # filtered set. Convert that numerical warning into an
+                # infeasible evaluation instead of allowing NaN to propagate.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("error", RuntimeWarning)
+                    next_node = int(heuristic(
+                        current_node, 0, candidates.copy(),
+                        distance_matrix.copy()))
+            except (TypeError, ValueError, IndexError, OverflowError,
+                    ZeroDivisionError, FloatingPointError, RuntimeWarning):
                 return None
             if next_node not in unvisited:
                 return None
