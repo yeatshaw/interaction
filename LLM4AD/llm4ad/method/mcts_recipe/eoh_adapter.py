@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import concurrent.futures
 import math
+import os
 import threading
 import time
 
@@ -22,7 +23,7 @@ class EoHRecipeExpander:
 
     def __init__(self, llm, evaluation, info, template_program,
                  num_samplers=10, num_evaluators=1, debug_mode=False,
-                 **evaluator_kwargs):
+                 operators=None, **evaluator_kwargs):
         self.info = dict(info)
         self.template_program = template_program
         self.sampler = EoHSampler(llm, template_program)
@@ -30,6 +31,15 @@ class EoHRecipeExpander:
                                          **evaluator_kwargs)
         self.num_samplers = max(1, int(num_samplers))
         self.num_evaluators = max(1, int(num_evaluators))
+        configured = operators if operators is not None else os.environ.get(
+            "LLM4AD_OPERATORS", "e1")
+        if isinstance(configured, str):
+            configured = [x.strip() for x in configured.split(",") if x.strip()]
+        self.operators = tuple(configured)
+        invalid = set(self.operators) - {"e1", "e2", "m1", "m2"}
+        if not self.operators or invalid:
+            raise ValueError(
+                f"LLM4AD_OPERATORS must contain e1/e2/m1/m2, got {self.operators}")
         # Sampling and evaluation use separate pools. Each sampling worker runs
         # an EoH-style pipeline and waits only for its own evaluation before it
         # decides whether another sample is still needed.
@@ -236,7 +246,7 @@ class EoHRecipeExpander:
 
     def __call__(self, population, recipe, selection_num, target_size,
                  on_evaluated=None, reserve_sample_order=None):
-        operators = ("e1", "e2", "m1", "m2")
+        operators = self.operators
         schedule_lock = threading.Lock()
         next_operator_index = 0
 
@@ -399,7 +409,7 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
         manager = getattr(self.retrieve_experiences, "__self__", None)
         if manager is not None and hasattr(manager, "begin_node"):
             manager.begin_node(parent_experiences)
-        operators = ("e1", "e2", "m1", "m2")
+        operators = self.operators
 
         try:
             # Freeze one node-local experience snapshot for the complete

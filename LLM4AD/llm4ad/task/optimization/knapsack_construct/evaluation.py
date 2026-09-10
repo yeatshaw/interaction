@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 
 from llm4ad.base import Evaluation
 from llm4ad.task.optimization.knapsack_construct.get_instance import GetData
-from llm4ad.task.optimization.knapsack_construct.template import template_program, task_description
+from llm4ad.task.optimization.knapsack_construct.template import task_description
 
 __all__ = ['KnapsackEvaluation']
 
@@ -55,12 +55,8 @@ class KnapsackEvaluation(Evaluation):
         """
         Initialize the evaluator for the Knapsack Problem.
         """
-        super().__init__(
-            template_program=template_program,
-            task_description=task_description,
-            use_numba_accelerate=False,
-            timeout_seconds=timeout_seconds
-        )
+        super().__init__(use_numba_accelerate=False,
+                         timeout_seconds=timeout_seconds)
 
         self.n_instance = n_instance
         self.n_items = n_items
@@ -161,7 +157,8 @@ class KnapsackEvaluation(Evaluation):
             total_value += value
 
         average_value = total_value / self.n_instance
-        return -average_value  # Positive because we want to maximize the total value
+        # Recipe-MCTS/EoH retain larger scores, and KP maximizes total value.
+        return average_value
 
 
 if __name__ == '__main__':

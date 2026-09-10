@@ -36,12 +36,12 @@
 
 from __future__ import annotations
 import matplotlib.pyplot as plt
+import numpy as np
 from typing import Callable, Any, List, Tuple
 import copy
 
 from llm4ad.base import Evaluation
 from llm4ad.task.optimization.bp_1d_construct.get_instance import GetData
-from llm4ad.task.optimization.bp_1d_construct.template import template_program, task_description
 
 __all__ = ['BP1DEvaluation']
 
@@ -60,12 +60,8 @@ class BP1DEvaluation(Evaluation):
         Args:
             n_bins: The number of available bins at the beginning.
         """
-        super().__init__(
-            template_program=template_program,
-            task_description=task_description,
-            use_numba_accelerate=False,
-            timeout_seconds=timeout_seconds
-        )
+        super().__init__(use_numba_accelerate=False,
+                         timeout_seconds=timeout_seconds)
 
         self.n_instance = n_instance
         self.n_items = n_items
@@ -128,22 +124,26 @@ class BP1DEvaluation(Evaluation):
         remaining_capacities = [bin_capacity] * n_bins  # Initialize remaining capacities of all bins
 
         while remaining_items:
-            # Determine feasible bins for the next item
-            feasible_bins = [bin_id for bin_id, capacity in enumerate(remaining_capacities) if capacity >= min(remaining_items)]
-
             # Use the heuristic to select the next item and bin
             remaining_items_copy = copy.deepcopy(remaining_items)
             remaining_capacities_copy = copy.deepcopy(remaining_capacities)
-            selected_item, selected_bin = eva(remaining_items_copy, remaining_capacities_copy)
+            try:
+                selected_item, selected_bin = eva(
+                    remaining_items_copy, remaining_capacities_copy)
+            except (TypeError, ValueError):
+                return None
 
-            if selected_bin is not None:
-                # Add the selected item to the selected bin
-                bins[selected_bin].append(selected_item)
-                # Update the remaining capacity of the selected bin
-                remaining_capacities[selected_bin] -= selected_item
-            else:
-                # If no feasible bin is found, stop packing (no more bins available)
-                break
+            if selected_bin is None or selected_item not in remaining_items:
+                return None
+            if not isinstance(selected_bin, (int, np.integer)):
+                return None
+            if selected_bin < 0 or selected_bin >= n_bins:
+                return None
+            if selected_item > remaining_capacities[selected_bin]:
+                return None
+
+            bins[selected_bin].append(selected_item)
+            remaining_capacities[selected_bin] -= selected_item
 
             if remaining_capacities[selected_bin] < 0:
                 return None
@@ -176,7 +176,10 @@ class BP1DEvaluation(Evaluation):
 
         for instance in self._datasets:
             item_weights, bin_capacity = instance
-            num_bins, _ = self.pack_items(item_weights, bin_capacity, eva, self.n_bins)
+            result = self.pack_items(item_weights, bin_capacity, eva, self.n_bins)
+            if result is None:
+                return None
+            num_bins, _ = result
             total_bins += num_bins
 
         average_bins = total_bins / self.n_instance
