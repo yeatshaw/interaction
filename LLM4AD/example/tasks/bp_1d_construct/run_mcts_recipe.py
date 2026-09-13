@@ -1,6 +1,7 @@
 """Run Recipe-MCTS on the repository's constructive 1D bin-packing task."""
 
 from pathlib import Path
+import argparse
 import os
 import sys
 
@@ -12,7 +13,21 @@ from llm4ad.tools.llm.llm_api_https import HttpsApi
 from example.tasks.mcts_recipe_runner import common_options, run_task
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run Recipe-MCTS on BP_1d.")
+    parser.add_argument(
+        "--train-data",
+        default=os.environ.get(
+            "LLM4AD_BP1D_TRAIN_DATA",
+            "/public/home/liuyang/dataset/bp_1d/train/bp_1d_10k_C100_train.pkl",
+        ),
+        help="Path to the BP_1d pickle training dataset.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     options = common_options("logs/mcts_recipe_bp_1d")
     evaluation = BP1DEvaluation(
         timeout_seconds=int(os.environ.get("LLM4AD_TIMEOUT", "300")),
@@ -20,6 +35,7 @@ def main():
         n_items=int(os.environ.get("LLM4AD_N_ITEMS", "500")),
         n_bins=int(os.environ.get("LLM4AD_N_BINS", "500")),
         bin_capacity=int(os.environ.get("LLM4AD_BIN_CAPACITY", "100")),
+        dataset_path=args.train_data,
     )
     llm = HttpsApi(
         host=os.environ.get("LLM4AD_API_HOST", "api.apilio.ai"),

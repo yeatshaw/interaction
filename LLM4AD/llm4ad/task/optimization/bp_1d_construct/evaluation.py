@@ -39,11 +39,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import Callable, Any, List, Tuple
 import copy
+import os
+import pickle
+from pathlib import Path
 
 from llm4ad.base import Evaluation
 from llm4ad.task.optimization.bp_1d_construct.get_instance import GetData
 
 __all__ = ['BP1DEvaluation']
+
+
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Load pickles written with NumPy 2.x in older NumPy environments."""
+
+    def find_class(self, module, name):
+        if module == "numpy._core" or module.startswith("numpy._core."):
+            module = "numpy.core" + module[len("numpy._core"):]
+        return super().find_class(module, name)
 
 
 class BP1DEvaluation(Evaluation):
@@ -55,6 +67,7 @@ class BP1DEvaluation(Evaluation):
                  n_instance: int = 8,
                  n_items: int = 500,
                  bin_capacity: int = 100,
+                 dataset_path: str | Path | None = None,
                  **kwargs):
         """
         Args:
@@ -63,12 +76,69 @@ class BP1DEvaluation(Evaluation):
         super().__init__(use_numba_accelerate=False,
                          timeout_seconds=timeout_seconds)
 
+        self.dataset_path = dataset_path or os.environ.get("LLM4AD_BP1D_TRAIN_DATA")
         self.n_instance = n_instance
         self.n_items = n_items
         self.bin_capacity = bin_capacity
         self.n_bins = n_bins
-        getData = GetData(self.n_instance, self.n_items, self.bin_capacity)
-        self._datasets = getData.generate_instances()
+        if self.dataset_path:
+            path = Path(self.dataset_path).expanduser()
+            if not path.is_file():
+                raise FileNotFoundError(f"BP_1d training dataset not found: {path}")
+            with path.open("rb") as file:
+                loaded = _NumpyCompatUnpickler(file).load()
+            self._datasets = self._normalize_datasets(loaded)
+            if not self._datasets:
+                raise ValueError(f"BP_1d training dataset is empty: {path}")
+            self.n_instance = len(self._datasets)
+            self.n_items = len(self._datasets[0][0])
+            self.bin_capacity = self._datasets[0][1]
+            self.n_bins = max(self.n_bins, max(len(instance[0])
+                                               for instance in self._datasets))
+        else:
+            getData = GetData(self.n_instance, self.n_items, self.bin_capacity)
+            self._datasets = getData.generate_instances()
+
+    @staticmethod
+    def _normalize_datasets(loaded):
+        """Normalize pickle layouts to (items, capacity, name, lower_bound)."""
+        if isinstance(loaded, dict):
+            for key in ("instances", "data", "datasets", "bp_1d"):
+                if key in loaded:
+                    loaded = loaded[key]
+                    break
+            else:
+                # A mapping of instance names to instance values is also valid.
+                loaded = list(loaded.values())
+        if isinstance(loaded, np.ndarray):
+            loaded = loaded.tolist()
+        if not isinstance(loaded, (list, tuple)):
+            raise ValueError("BP_1d dataset must be a list or dictionary of instances")
+
+        datasets = []
+        for index, instance in enumerate(loaded):
+            if isinstance(instance, dict):
+                items = instance.get("item_weights", instance.get("items"))
+                capacity = instance.get("bin_capacity", instance.get("capacity", 100))
+                name = instance.get("instance", instance.get("name", f"instance_{index + 1:03d}"))
+                lower_bound = instance.get("theoretical_lower_bound")
+            elif isinstance(instance, (list, tuple)) and len(instance) == 2:
+                items, capacity = instance
+                name = f"instance_{index + 1:03d}"
+                lower_bound = None
+            else:
+                raise ValueError(f"Invalid BP_1d instance at index {index}")
+            items = np.asarray(items).reshape(-1).tolist()
+            if not items or any(float(item) <= 0 for item in items):
+                raise ValueError(f"Invalid item weights at BP_1d instance {index}")
+            item_weights = [int(item) for item in items]
+            capacity = int(capacity)
+            if capacity <= 0 or any(item <= 0 or item > capacity for item in item_weights):
+                raise ValueError(f"Invalid BP_1d weights/capacity at instance {index}")
+            if lower_bound is None:
+                lower_bound = int(np.ceil(sum(item_weights) / capacity))
+            datasets.append((item_weights, capacity, str(name), int(lower_bound)))
+        return datasets
 
     def plot_bins(self, bins: List[List[int]], bin_capacity: int):
         """
@@ -175,7 +245,7 @@ class BP1DEvaluation(Evaluation):
         total_bins = 0
 
         for instance in self._datasets:
-            item_weights, bin_capacity = instance
+            item_weights, bin_capacity = instance[:2]
             result = self.pack_items(item_weights, bin_capacity, eva, self.n_bins)
             if result is None:
                 return None
