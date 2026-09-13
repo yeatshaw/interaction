@@ -16,11 +16,12 @@ from ...method.mcts_recipe.recipes import get_default_recipes
 
 
 class AdaptiveRecipeEoH(EoH):
-    """Single-path EoH where every offspring chooses its own reflection recipe.
+    """Single-path EoH where every generation chooses one reflection recipe.
 
     The parent EoH and MCTS-Recipe implementations are deliberately untouched.
     Recipe prompts are produced by the existing ``EoHPrompt`` implementation;
     this class only chooses which existing configuration is used for one sample.
+    All offspring generated in the same generation share that recipe.
     ``recipe_reflectors`` can provide a task-specific implementation for the
     RefineEvo recipe.  Other recipes use the normal EoH reflection prompt.
     """
@@ -51,6 +52,10 @@ class AdaptiveRecipeEoH(EoH):
                 "RefineEvo recipes require recipe_reflectors callbacks: "
                 + ", ".join(missing))
         self._recipe_lock = threading.RLock()
+        # One recipe is sampled for each evolutionary generation.  The value
+        # is keyed by generation so workers that started before survival keep
+        # using the recipe assigned to their original generation.
+        self._generation_recipes = {}
         self._sample_lock = threading.RLock()
         self._prompt_lock = threading.RLock()
         self._recipe_local = threading.local()
@@ -175,15 +180,27 @@ class AdaptiveRecipeEoH(EoH):
             )
         return self._sampler.llm.draw_sample(prompt).strip()
 
-    def _prepare_reflection(self, refs, operator=None):
-        """Choose and execute one recipe for this sample only."""
+    def _generation_recipe(self, generation):
+        """Return the recipe shared by all samples in one generation."""
+        with self._recipe_lock:
+            selected = self._generation_recipes.get(generation)
+            if selected is None:
+                recipe_id, probability = self._select_recipe()
+                selected = (recipe_id, probability)
+                self._generation_recipes[generation] = selected
+            return selected
+
+    def _prepare_reflection(self, refs, operator=None, generation=None):
+        """Prepare reflection using the recipe assigned to this generation."""
         if not self._population.population:
             self._recipe_local.context = {
                 "recipe_id": None, "probability": 0.0,
                 "suggestion": None, "baseline": None,
             }
             return
-        recipe_id, probability = self._select_recipe()
+        if generation is None:
+            generation = self._population.generation
+        recipe_id, probability = self._generation_recipe(generation)
         recipe_state = None
         try:
             reflection = self._recipe_reflection(refs, recipe_id, operator)
@@ -314,10 +331,14 @@ class AdaptiveRecipeEoH(EoH):
                     file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _operator_step(self, operator):
+        # Capture the generation before selecting references.  Registration of
+        # another worker may advance Population.generation while this sample
+        # is being reflected or evaluated; its context must remain unchanged.
+        generation = self._population.generation
         count = self._selection_num if operator in ("e1", "e2") else 1
         refs = (self._population.selection_many(count) if count > 1
                 else [self._population.selection()])
-        self._prepare_reflection(refs, operator)
+        self._prepare_reflection(refs, operator, generation)
         suggestion = self._recipe_local.context.get("suggestion")
         with self._prompt_lock:
             if operator == "e1":

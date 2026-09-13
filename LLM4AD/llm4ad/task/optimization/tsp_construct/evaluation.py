@@ -34,8 +34,33 @@ class TSPEvaluation(Evaluation):
 
     @staticmethod
     def _validate_datasets(datasets):
+        # Training data is commonly stored as a list of
+        # ``(coordinates, distance_matrix)`` pairs.  TSPLIB data is stored as
+        # ``{instance_name: {coordinates, optimal_value, ...}}``; normalize
+        # both forms here so the evaluator does not need task-specific callers.
+        if isinstance(datasets, dict):
+            normalized = []
+            for name, value in datasets.items():
+                if not isinstance(value, dict) or "coordinates" not in value:
+                    raise ValueError(
+                        f"TSP instance {name!r} must contain 'coordinates'.")
+                coordinates = np.asarray(value["coordinates"], dtype=float)
+                distance_matrix = value.get("distance_matrix")
+                if distance_matrix is None:
+                    distance_matrix = value.get("distances")
+                if distance_matrix is None:
+                    if len(coordinates) > 2000:
+                        raise ValueError(
+                            f"TSP instance {name!r} has {len(coordinates)} nodes; "
+                            "provide a precomputed distance_matrix or filter "
+                            "large instances before evaluation.")
+                    delta = coordinates[:, np.newaxis, :] - coordinates[np.newaxis, :, :]
+                    distance_matrix = np.linalg.norm(delta, axis=2)
+                normalized.append((coordinates, np.asarray(distance_matrix, dtype=float)))
+            datasets = normalized
         if not isinstance(datasets, (list, tuple)) or not datasets:
-            raise ValueError("TSP dataset must be a non-empty list of instance pairs.")
+            raise ValueError(
+                "TSP dataset must be a non-empty list or instance dictionary.")
         validated = []
         for index, item in enumerate(datasets):
             if not isinstance(item, (list, tuple)) or len(item) != 2:

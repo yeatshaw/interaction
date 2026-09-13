@@ -1,4 +1,4 @@
-"""Shared runner for single-path EoH with per-offspring recipe selection."""
+"""Shared runner for single-path EoH with per-generation recipe selection."""
 
 from __future__ import annotations
 
