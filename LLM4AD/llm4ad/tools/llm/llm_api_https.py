@@ -162,6 +162,7 @@ class HttpsApi(LLM):
 
                 # Extract content from the standard response format
                 response = data['choices'][0]['message']['content']
+                self._record_token_usage(data.get('usage'))
                 # Reset error counter on success
                 if self.debug_mode:
                     self._cumulative_error = 0

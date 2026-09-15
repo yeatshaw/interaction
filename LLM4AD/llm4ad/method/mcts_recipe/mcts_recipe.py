@@ -94,7 +94,8 @@ class MCTSRecipe:
             if np is not None:
                 np.random.seed(seed)
 
-    def initialize(self, individuals, initial_samples_recorded=False):
+    def initialize(self, individuals, initial_samples_recorded=False,
+                   initial_token_usage=None):
         population = RecipePopulation(copy.deepcopy(individuals), self.pop_size)
         if not population.individuals:
             raise ValueError("initial population cannot be empty")
@@ -102,11 +103,12 @@ class MCTSRecipe:
         best = max(x.score for x in population.individuals)
         root_id = self._next_population_node_id
         self._next_population_node_id += 1
-        root = RecipeNode(root_id, best, depth=0)
+        root = RecipeNode(root_id, best, depth=0,
+                          token_usage=initial_token_usage)
         self.tree.root = root
         if not initial_samples_recorded:
             self._record_best_candidates(population.individuals, root)
-        self._write_node(root, population, None, [])
+        self._write_node(root, population, None, [], initial_token_usage)
         # Persist the root once immediately. Subsequent nodes use batching.
         if self.store.flush() is not None:
             self._checkpoint_index += 1
@@ -179,15 +181,19 @@ class MCTSRecipe:
                     "score": score,
                     "evaluate_time": getattr(individual, "evaluate_time", None),
                     "sample_time": getattr(individual, "sample_time", None),
+                    "token_usage": getattr(individual, "_recipe_token_usage", None),
                 }
                 self._best_samples.append(best_record)
                 self.store.write_best_samples(self._best_samples)
 
-    def _write_node(self, node, population, recipe_id, experiences):
+    def _write_node(self, node, population, recipe_id, experiences,
+                    token_usage=None):
+        if token_usage is None:
+            token_usage = getattr(node, "token_usage", None)
         flushed = self.store.add(
             node.population_node_id, node.parent_population_node_id,
             node.depth, recipe_id, population.generation, population,
-            experiences)
+            experiences, token_usage=token_usage)
         if flushed is not None:
             self._checkpoint_index += 1
             self._write_checkpoint()
@@ -264,6 +270,7 @@ class MCTSRecipe:
                 offspring, new_experiences = result
             else:
                 offspring, new_experiences = result, []
+            node_token_usage = getattr(expander, "last_node_token_usage", None)
             with self._tree_lock:
                 if offspring:
                     self._assign_algorithm_ids(offspring)
@@ -275,14 +282,21 @@ class MCTSRecipe:
                     child_id,
                     max(x.score for x in child_population.individuals),
                     depth=node.depth + 1, parent=node,
-                    incoming_recipe_id=recipe_id)
+                    incoming_recipe_id=recipe_id,
+                    token_usage=node_token_usage)
                 node.add_child(child)
                 # One completed recipe edge is one visit to its new child and
                 # one additional visit propagated through every ancestor.
                 self.tree.backpropagate(child)
                 branch_experiences.extend(new_experiences)
                 self._write_node(child, child_population, recipe_id,
-                                 branch_experiences)
+                                 branch_experiences, node_token_usage)
+                print(
+                    f"Generated population node {child_id} "
+                    f"recipe={recipe_id} depth={child.depth} "
+                    f"tokens={node_token_usage}",
+                    flush=True,
+                )
                 children.append(child)
 
         with concurrent.futures.ThreadPoolExecutor(
@@ -294,7 +308,7 @@ class MCTSRecipe:
         return children
 
     def run(self, initial_individuals=None, checkpoint=None,
-            initial_samples_recorded=False):
+            initial_samples_recorded=False, initial_token_usage=None):
         if checkpoint is not None:
             self.restore(checkpoint)
         else:
@@ -304,7 +318,8 @@ class MCTSRecipe:
                 raise FileExistsError(
                     f"{self.store.directory} already contains population nodes; "
                     "use a new LLM4AD_LOG_DIR or set LLM4AD_CHECKPOINT")
-            self.initialize(initial_individuals, initial_samples_recorded)
+            self.initialize(initial_individuals, initial_samples_recorded,
+                            initial_token_usage)
         while True:
             node = self.tree.select()
             if node.depth >= self.max_depth:
@@ -375,6 +390,7 @@ class MCTSRecipe:
                     "children_population_node_ids": [x.population_node_id for x in node.children],
                     "expanded_recipe_ids": sorted(node.expanded_recipe_ids),
                     "incoming_recipe_id": node.incoming_recipe_id,
+                    "token_usage": getattr(node, "token_usage", None),
                 })
                 stack.extend(node.children)
         state = {

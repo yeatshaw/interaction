@@ -52,6 +52,7 @@ def function_from_record(record, template_program=None):
     function.operator = record.get("operator")
     function.evaluate_time = record.get("evaluate_time")
     function.sample_time = record.get("sample_time")
+    function._recipe_token_usage = record.get("token_usage")
     function._recipe_id = record.get("recipe_id")
     return function
 
@@ -78,7 +79,8 @@ def restore_tree(checkpoint):
     for node_id, record in records.items():
         nodes[node_id] = RecipeNode(node_id, record["Q"], record["depth"],
                                     visits=record.get("visits", 1),
-                                    incoming_recipe_id=record.get("incoming_recipe_id"))
+                                    incoming_recipe_id=record.get("incoming_recipe_id"),
+                                    token_usage=record.get("token_usage"))
     root = None
     for node_id, record in records.items():
         parent_id = record.get("parent_population_node_id")

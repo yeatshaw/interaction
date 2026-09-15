@@ -158,7 +158,9 @@ class LocalVLLMAPI(LLM):
         headers = {'Content-Type': 'application/json'}
         response = requests.post(url, data=json.dumps(data), headers=headers)
         if response.status_code == 200:
-            response = response.json()['content']
+            payload = response.json()
+            self._record_token_usage(payload.get('usage'))
+            response = payload['content']
             return response[0]
 
     def __del__(self):

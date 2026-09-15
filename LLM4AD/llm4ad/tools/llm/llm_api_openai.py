@@ -38,4 +38,5 @@ class OpenAIAPI(LLM):
             messages=prompt,
             stream=False,
         )
+        self._record_token_usage(getattr(response, "usage", None))
         return response.choices[0].message.content

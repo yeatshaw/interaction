@@ -35,6 +35,7 @@ class RecipeStore:
             "operator": getattr(individual, "operator", None),
             "evaluate_time": getattr(individual, "evaluate_time", None),
             "sample_time": getattr(individual, "sample_time", None),
+            "token_usage": getattr(individual, "_recipe_token_usage", None),
             "code": (individual.to_code_without_docstring()
                      if hasattr(individual, "to_code_without_docstring")
                      else str(individual)),
@@ -42,7 +43,7 @@ class RecipeStore:
         }
 
     def add(self, node_id, parent_id, depth, recipe_id, generation, population,
-            experiences=None):
+            experiences=None, token_usage=None):
         self.buffer.append({
             "population_node_id": node_id,
             "parent_population_node_id": parent_id,
@@ -51,6 +52,7 @@ class RecipeStore:
             "generation": generation,
             "population_size": len(population.individuals),
             "best_score": max((x.score for x in population.individuals), default=float("-inf")),
+            "token_usage": token_usage,
             "algorithms": [self._algorithm_record(x) for x in population.individuals],
             "experiences": list(experiences or []),
         })

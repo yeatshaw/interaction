@@ -7,13 +7,14 @@ import time
 import concurrent.futures
 import math
 import json
+import threading
 import urllib.request
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 
 from llm4ad.base import SecureEvaluator, TextFunctionProgramConverter
-from llm4ad.method.eoh.prompt import EoHPrompt
 from llm4ad.method.eoh.sampler import EoHSampler
 from llm4ad.method.mcts_recipe import (
     EoHRecipeExpander,
@@ -23,6 +24,67 @@ from llm4ad.method.mcts_recipe import (
     RefineEvoExperienceManager,
     get_default_recipes,
 )
+
+
+REFINEEVO_SYSTEM_GENERATOR_TEMPLATE = """You are a world-class expert in optimization algorithms and heuristic design with deep expertise in operations research, combinatorial optimization, and metaheuristic methods.
+
+## YOUR ROLE
+Design novel, efficient, and effective heuristic algorithms to solve complex optimization problems.
+
+## PROBLEM CONTEXT
+**Function Name:** {func_name}
+**Problem Description:** {problem_desc}
+**Detailed Specification:**
+{func_desc}
+
+## ALGORITHM DESIGN PRINCIPLES
+1. **Novelty**: Create algorithms with unique characteristics that differ from existing approaches
+2. **Efficiency**: Ensure computational efficiency suitable for the problem scale
+3. **Robustness**: Design algorithms that perform well across diverse problem instances
+
+## OUTPUT FORMAT REQUIREMENTS
+You must provide your response in exactly two parts:
+
+**Part 1: Algorithm Description**
+- Write a concise one-sentence description of your algorithm
+- Enclose the description in curly braces: {{your algorithm description here}}
+- Focus on the core innovation and key mechanism
+
+**Part 2: Python Implementation**
+- Provide complete, runnable Python code
+- Enclose code in: ```python ... ```
+- Follow the exact function signature specified
+- Include necessary imports within the function
+- Use clear variable names and efficient data structures
+- Ensure code is production-ready without bugs
+
+## IMPORTANT CONSTRAINTS
+- Do NOT provide any additional explanations, commentary, or discussion
+- Do NOT include example usage or test cases
+- Output ONLY the algorithm description in braces and the Python code block
+- Ensure the code is syntactically correct and logically sound"""
+
+
+REFINEEVO_USER_INIT_TEMPLATE = """## TASK: Generate Initial Algorithm
+
+You are tasked with designing a novel heuristic algorithm from scratch. This is the initial design phase where you will create the foundation for the evolutionary algorithm development process.
+
+### REFERENCE IMPLEMENTATION
+Below is a baseline implementation to illustrate the expected code structure and format:
+
+{seed_func}
+
+### ADDITIONAL DOMAIN KNOWLEDGE
+{external_knowledge}
+"""
+
+
+REFINEEVO_PROBLEM_ALIASES = {
+    "tsp_construct": "tsp_constructive",
+    "cvrp_construct": "cvrp_constructive",
+    "vrptw_construct": "vrptw_constructive",
+    "kp_construct": "kp_constructive",
+}
 
 
 class OpenAIEmbedding:
@@ -66,21 +128,130 @@ def _int_env(name, default):
     return int(os.environ.get(name, str(default)))
 
 
+def _read_text_if_exists(path):
+    try:
+        path = Path(path)
+        if path.is_file():
+            return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return None
+
+
+def _refineevo_prompt_root():
+    configured = os.environ.get("LLM4AD_REFINEEVO_ROOT")
+    if configured:
+        return Path(configured) / "prompts"
+    configured = os.environ.get("LLM4AD_REFINEEVO_PROMPT_DIR")
+    if configured:
+        return Path(configured)
+    repository_root = Path(__file__).resolve().parents[2]
+    workspace_root = repository_root.parent.parent
+    return workspace_root / "RefineEvo" / "prompts"
+
+
+def _refineevo_problem_name(template_module):
+    configured = os.environ.get("LLM4AD_REFINEEVO_PROBLEM")
+    if configured:
+        return configured.strip()
+    task_name = template_module.split(".")[-2]
+    return REFINEEVO_PROBLEM_ALIASES.get(task_name, task_name)
+
+
+def _refineevo_initial_prompt(info, template_module):
+    prompt_root = _refineevo_prompt_root()
+    common_dir = prompt_root / "common"
+    problem_dir = prompt_root / _refineevo_problem_name(template_module)
+
+    system_template = (_read_text_if_exists(common_dir / "system_generator.txt")
+                       or REFINEEVO_SYSTEM_GENERATOR_TEMPLATE)
+    user_template = (_read_text_if_exists(common_dir / "user_init.txt")
+                     or REFINEEVO_USER_INIT_TEMPLATE)
+
+    func_desc = (_read_text_if_exists(problem_dir / "func_desc.txt")
+                 or info.get("method_args")
+                 or info.get("task_description", ""))
+    seed_func = (_read_text_if_exists(problem_dir / "seed_func.txt")
+                 or info.get("seed_func")
+                 or info["template_program"])
+    external_knowledge = (
+        _read_text_if_exists(problem_dir / "external_knowledge.txt")
+        or info.get("external_knowledge")
+        or "No additional domain knowledge provided."
+    )
+
+    system = system_template.format(
+        func_name=info["method_name"],
+        problem_desc=info["task_description"],
+        func_desc=func_desc,
+    )
+    user = user_template.format(
+        seed_func=seed_func,
+        external_knowledge=external_knowledge,
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
 def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
                         num_samplers=1, debug=False, on_evaluated=None,
                         reserve_sample_order=None):
-    """Generate and evaluate the root population with the EoH i1 prompt."""
+    """Generate and evaluate the root population with the RefineEvo init prompt."""
     sampler = EoHSampler(llm, info["template_program"])
     evaluator = SecureEvaluator(evaluation, debug_mode=debug)
     individuals = []
-    prompt = EoHPrompt.get_prompt_i1(info)
+    prompt = _refineevo_initial_prompt(info, info["template_module"])
     max_attempts = pop_size * 2
+    token_usage_records = []
+    token_usage_lock = threading.RLock()
+
+    def capture_token_usage():
+        capture = getattr(llm, "capture_token_usage", None)
+        if callable(capture):
+            return capture()
+        return nullcontext({})
+
+    def compact_token_usage(usage):
+        compact = getattr(llm, "compact_token_usage", None)
+        if callable(compact):
+            return compact(usage)
+        return usage or None
+
+    def record_token_usage(usage):
+        usage = compact_token_usage(usage)
+        if usage:
+            with token_usage_lock:
+                token_usage_records.append(usage)
+        return usage
+
+    def merge_token_usage():
+        with token_usage_lock:
+            records = list(token_usage_records)
+        merge = getattr(llm, "merge_token_usage", None)
+        if callable(merge):
+            usage = merge(*records)
+            return compact_token_usage(usage) or {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+            }
+        return {
+            "prompt_tokens": sum(int(item.get("prompt_tokens", 0)) for item in records),
+            "completion_tokens": sum(int(item.get("completion_tokens", 0)) for item in records),
+        }
 
     def sample_one():
         sample_order = (reserve_sample_order()
                         if reserve_sample_order is not None else None)
         sample_start = time.time()
-        thought, function = sampler.get_thought_and_function(prompt)
+        evolution_usage = None
+        token_usage = None
+        try:
+            with capture_token_usage() as evolution_usage:
+                thought, function = sampler.get_thought_and_function(prompt)
+        finally:
+            token_usage = record_token_usage(evolution_usage)
         sample_time = time.time() - sample_start
         if thought is None or function is None:
             return None
@@ -98,6 +269,7 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
         function.score = score
         function.evaluate_time = eval_time
         function.sample_time = sample_time
+        function._recipe_token_usage = token_usage
         function.operator = "i1"
         function._recipe_sample_order = sample_order
         if on_evaluated is not None:
@@ -122,7 +294,7 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
     if len(individuals) < pop_size:
         print(f"Initialization stopped after {max_attempts} samples with "
               f"{len(individuals)}/{pop_size} feasible algorithms")
-    return individuals
+    return individuals, merge_token_usage()
 
 
 def run_task(*, method_name, template_module, evaluation, llm,
@@ -131,6 +303,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
     from example.tasks.utils import get_info
 
     info = get_info(method_name, template_module)
+    info["template_module"] = template_module
     checkpoint = os.environ.get("LLM4AD_CHECKPOINT")
     if checkpoint:
         store_dir = Path(checkpoint).resolve().parent
@@ -138,6 +311,10 @@ def run_task(*, method_name, template_module, evaluation, llm,
     store_dir.mkdir(parents=True, exist_ok=True)
     print(f"Recipe-MCTS output directory: {store_dir}", flush=True)
     recipes = get_default_recipes()
+    print(
+        f"Recipe-MCTS recipes ({len(recipes)}): {', '.join(recipes)}",
+        flush=True,
+    )
     mode = os.environ.get(
         "LLM4AD_MCTS_RECIPE_MODE",
         "no_reflection" if os.environ.get("LLM4AD_NO_REFLECTION", "0") == "1"
@@ -213,7 +390,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
         else:
             # Construct the recorder before sampling so every evaluated root
             # candidate can update sample_best.json immediately.
-            initial = _initial_population(
+            initial, initial_token_usage = _initial_population(
                 llm, evaluation, info, pop_size, selection_num,
                 num_samplers, debug,
                 on_evaluated=lambda function: method.record_evaluated_sample(
@@ -225,6 +402,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
             checkpoint=checkpoint,
             # Root samples were already recorded by the callback above.
             initial_samples_recorded=(checkpoint is None),
+            initial_token_usage=(None if checkpoint else initial_token_usage),
         )
     finally:
         for expander in expanders.values():

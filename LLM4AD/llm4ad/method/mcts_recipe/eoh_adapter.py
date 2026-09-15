@@ -8,6 +8,7 @@ import math
 import os
 import threading
 import time
+from contextlib import nullcontext
 
 from ..eoh.prompt import EoHPrompt
 from ..eoh.sampler import EoHSampler
@@ -32,7 +33,7 @@ class EoHRecipeExpander:
         self.num_samplers = max(1, int(num_samplers))
         self.num_evaluators = max(1, int(num_evaluators))
         configured = operators if operators is not None else os.environ.get(
-            "LLM4AD_OPERATORS", "e1")
+            "LLM4AD_OPERATORS", "e1,e2,m1,m2")
         if isinstance(configured, str):
             configured = [x.strip() for x in configured.split(",") if x.strip()]
         self.operators = tuple(configured)
@@ -52,6 +53,7 @@ class EoHRecipeExpander:
         self._prompt_lock = threading.RLock()
         self._closed = False
         self.debug_mode = debug_mode
+        self.last_node_token_usage = self._merge_token_usage([])
 
     def close(self, close_llm=True):
         if self._closed:
@@ -61,6 +63,42 @@ class EoHRecipeExpander:
         self.evaluation_executor.shutdown(wait=True, cancel_futures=True)
         if close_llm:
             self.sampler.llm.close()
+
+    def _capture_token_usage(self):
+        capture = getattr(self.sampler.llm, "capture_token_usage", None)
+        if callable(capture):
+            return capture()
+        return nullcontext({})
+
+    def _compact_token_usage(self, usage):
+        compact = getattr(self.sampler.llm, "compact_token_usage", None)
+        if callable(compact):
+            return compact(usage)
+        return usage or None
+
+    def _merge_token_usage(self, usages):
+        empty = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+        merge = getattr(self.sampler.llm, "merge_token_usage", None)
+        if callable(merge):
+            return self._compact_token_usage(merge(*usages)) or empty.copy()
+        return {
+            "prompt_tokens": sum(int(item.get("prompt_tokens", 0)) for item in usages if item),
+            "completion_tokens": sum(int(item.get("completion_tokens", 0)) for item in usages if item),
+        }
+
+    def _record_attempt_token_usage(self, usage, recorder):
+        token_usage = self._compact_token_usage(usage)
+        if recorder is not None and token_usage:
+            recorder(token_usage)
+        return token_usage
+
+    def _token_usage_total(self, *usages):
+        return self._merge_token_usage([
+            usage for usage in usages if self._compact_token_usage(usage)
+        ])
 
     def _reflect(self, children, population, recipe, parents=None):
         values = recipe.values
@@ -121,7 +159,8 @@ class EoHRecipeExpander:
         return prompt
 
     def _prepare_candidate(self, refs, population, recipe, operator,
-                           reserve_sample_order=None):
+                           reserve_sample_order=None,
+                           record_token_usage=None):
         """Perform reflection and LLM/code generation, but do not evaluate.
 
         The returned dictionary is intentionally independent of evaluation so
@@ -131,12 +170,17 @@ class EoHRecipeExpander:
         sample_order = (reserve_sample_order()
                         if reserve_sample_order is not None else None)
         sample_start = time.time()
+        reflection_usage = None
+        evolution_usage = None
+        token_usage = None
         try:
             # Front-loaded reflection. References without lineage parents use
             # the reference section; later generations use parents vs children.
-            suggestion = self._reflect(refs, population, recipe)
+            with self._capture_token_usage() as reflection_usage:
+                suggestion = self._reflect(refs, population, recipe)
             prompt = self._generation_prompt(refs, suggestion, operator)
-            thought, function = self.sampler.get_thought_and_function(prompt)
+            with self._capture_token_usage() as evolution_usage:
+                thought, function = self.sampler.get_thought_and_function(prompt)
             if thought is None or function is None:
                 return None
             program = TextFunctionProgramConverter.function_to_program(
@@ -147,10 +191,16 @@ class EoHRecipeExpander:
             if self.debug_mode:
                 print(f"DEBUG: candidate generation failed: {exc}")
             return None
+        finally:
+            token_usage = self._token_usage_total(
+                reflection_usage, evolution_usage)
+            token_usage = self._record_attempt_token_usage(
+                token_usage, record_token_usage)
 
         sample_time = time.time() - sample_start
         function.algorithm = thought
         function.sample_time = sample_time
+        function._recipe_token_usage = token_usage
         function.operator = operator
         function._eoh_parent_ids = tuple(
             getattr(ref, "_recipe_algorithm_id", None) for ref in refs)
@@ -164,6 +214,7 @@ class EoHRecipeExpander:
             "operator": operator,
             "suggestion": suggestion,
             "sample_time": sample_time,
+            "token_usage": token_usage,
         }
 
     def _evaluate_candidates(self, candidates, on_evaluated=None):
@@ -255,7 +306,15 @@ class EoHRecipeExpander:
                  on_evaluated=None, reserve_sample_order=None):
         operators = self.operators
         schedule_lock = threading.Lock()
+        token_usage_records = []
+        token_usage_lock = threading.RLock()
         next_operator_index = 0
+
+        def record_token_usage(usage):
+            if not usage:
+                return
+            with token_usage_lock:
+                token_usage_records.append(usage)
 
         def prepare_one():
             nonlocal next_operator_index
@@ -272,10 +331,16 @@ class EoHRecipeExpander:
                 return None
             return self._prepare_candidate(
                 refs, population, recipe, operator,
-                reserve_sample_order=reserve_sample_order)
+                reserve_sample_order=reserve_sample_order,
+                record_token_usage=record_token_usage)
 
-        evaluated = self._collect_until_target(
-            prepare_one, target_size, on_evaluated=on_evaluated)
+        try:
+            evaluated = self._collect_until_target(
+                prepare_one, target_size, on_evaluated=on_evaluated)
+        finally:
+            with token_usage_lock:
+                self.last_node_token_usage = self._merge_token_usage(
+                    token_usage_records)
         offspring = [candidate["function"] for candidate in evaluated]
         if len(offspring) < target_size and self.debug_mode:
             print(f"DEBUG: recipe {recipe.recipe_id} produced "
@@ -285,12 +350,15 @@ class EoHRecipeExpander:
 
     def _generate_without_reflection(self, refs, recipe, operator="e1"):
         """Generate one child using the original EoH operator prompt."""
+        evolution_usage = None
+        token_usage = None
         try:
             refs = copy.deepcopy(list(refs))
             prompt = self._generation_prompt(
                 refs, None, operator, include_suggestion=False)
             sample_start = time.time()
-            thought, function = self.sampler.get_thought_and_function(prompt)
+            with self._capture_token_usage() as evolution_usage:
+                thought, function = self.sampler.get_thought_and_function(prompt)
             if thought is None or function is None:
                 return None
             program = TextFunctionProgramConverter.function_to_program(
@@ -299,6 +367,8 @@ class EoHRecipeExpander:
                 return None
             function.algorithm = thought
             function.sample_time = time.time() - sample_start
+            token_usage = self._token_usage_total(evolution_usage)
+            function._recipe_token_usage = token_usage
             function.operator = operator
             function._recipe_id = recipe.recipe_id
             function._eoh_parent_ids = tuple(
@@ -321,15 +391,19 @@ class NoReflectionEoHRecipeExpander(EoHRecipeExpander):
     """Expand a recipe edge with EoH operators but no reflection prompt."""
 
     def _prepare_candidate(self, refs, population, recipe, operator,
-                           reserve_sample_order=None):
+                           reserve_sample_order=None,
+                           record_token_usage=None):
         sample_order = (reserve_sample_order()
                         if reserve_sample_order is not None else None)
         sample_start = time.time()
+        evolution_usage = None
+        token_usage = None
         try:
             refs = copy.deepcopy(list(refs))
             prompt = self._generation_prompt(
                 refs, None, operator, include_suggestion=False)
-            thought, function = self.sampler.get_thought_and_function(prompt)
+            with self._capture_token_usage() as evolution_usage:
+                thought, function = self.sampler.get_thought_and_function(prompt)
             if thought is None or function is None:
                 return None
             program = TextFunctionProgramConverter.function_to_program(
@@ -340,10 +414,15 @@ class NoReflectionEoHRecipeExpander(EoHRecipeExpander):
             if self.debug_mode:
                 print(f"DEBUG: candidate generation failed: {exc}")
             return None
+        finally:
+            token_usage = self._token_usage_total(evolution_usage)
+            token_usage = self._record_attempt_token_usage(
+                token_usage, record_token_usage)
 
         sample_time = time.time() - sample_start
         function.algorithm = thought
         function.sample_time = sample_time
+        function._recipe_token_usage = token_usage
         function.operator = operator
         function._eoh_parent_ids = tuple(
             getattr(ref, "_recipe_algorithm_id", None) for ref in refs)
@@ -357,6 +436,7 @@ class NoReflectionEoHRecipeExpander(EoHRecipeExpander):
             "operator": operator,
             "suggestion": None,
             "sample_time": sample_time,
+            "token_usage": token_usage,
         }
 
     def __call__(self, population, recipe, selection_num, target_size,
@@ -401,7 +481,8 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
 
     def _prepare_experience_candidate(self, refs, recipe, operator,
                                       parent_experiences,
-                                      reserve_sample_order=None):
+                                      reserve_sample_order=None,
+                                      record_token_usage=None):
         """Retrieve/distill experience and generate one candidate.
 
         This is the sampling phase of RefineEvo.  Distillation may itself call
@@ -412,21 +493,26 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
         sample_order = (reserve_sample_order()
                         if reserve_sample_order is not None else None)
         sample_start = time.time()
+        reflection_usage = None
+        evolution_usage = None
+        token_usage = None
         try:
-            retrieved = (self.retrieve_experiences(
-                refs, operator, list(parent_experiences))
-                if self.retrieve_experiences else [])
-            retrieved = retrieved if isinstance(retrieved, list) else []
-            fresh = (self.distill_experience(refs, operator)
-                     if self.distill_experience else [])
-            fresh = fresh if isinstance(fresh, list) else ([fresh] if fresh else [])
-            guidance = self._format_experiences(retrieved + fresh)
-            prompt = self._generation_prompt(refs, guidance or None, operator)
-            if guidance:
-                prompt = prompt.replace(
-                    "These are some suggestions after reflecting on the given algorithms:",
-                    "These are successful and failed design experiences retrieved from previous attempts:")
-            thought, function = self.sampler.get_thought_and_function(prompt)
+            with self._capture_token_usage() as reflection_usage:
+                retrieved = (self.retrieve_experiences(
+                    refs, operator, list(parent_experiences))
+                    if self.retrieve_experiences else [])
+                retrieved = retrieved if isinstance(retrieved, list) else []
+                fresh = (self.distill_experience(refs, operator)
+                         if self.distill_experience else [])
+                fresh = fresh if isinstance(fresh, list) else ([fresh] if fresh else [])
+                guidance = self._format_experiences(retrieved + fresh)
+                prompt = self._generation_prompt(refs, guidance or None, operator)
+                if guidance:
+                    prompt = prompt.replace(
+                        "These are some suggestions after reflecting on the given algorithms:",
+                        "These are successful and failed design experiences retrieved from previous attempts:")
+            with self._capture_token_usage() as evolution_usage:
+                thought, function = self.sampler.get_thought_and_function(prompt)
             if thought is None or function is None:
                 return None
             program = TextFunctionProgramConverter.function_to_program(
@@ -437,10 +523,16 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
             if self.debug_mode:
                 print(f"DEBUG: RefineEvo candidate generation failed: {exc}")
             return None
+        finally:
+            token_usage = self._token_usage_total(
+                reflection_usage, evolution_usage)
+            token_usage = self._record_attempt_token_usage(
+                token_usage, record_token_usage)
 
         sample_time = time.time() - sample_start
         function.algorithm = thought
         function.sample_time = sample_time
+        function._recipe_token_usage = token_usage
         function.operator = operator
         function._recipe_id = recipe.recipe_id
         function._recipe_sample_order = sample_order
@@ -458,6 +550,7 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
             "fresh": fresh,
             "experience_text": guidance,
             "sample_time": sample_time,
+            "token_usage": token_usage,
         }
 
     def __call__(self, population, recipe, selection_num, target_size,
@@ -465,10 +558,18 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
                  reserve_sample_order=None):
         parent_experiences = list(experiences or [])
         experience_lock = threading.RLock()
+        token_usage_records = []
+        token_usage_lock = threading.RLock()
         manager = getattr(self.retrieve_experiences, "__self__", None)
         if manager is not None and hasattr(manager, "begin_node"):
             manager.begin_node(parent_experiences)
         operators = self.operators
+
+        def record_token_usage(usage):
+            if not usage:
+                return
+            with token_usage_lock:
+                token_usage_records.append(usage)
 
         try:
             # Freeze one node-local experience snapshot for the complete
@@ -493,7 +594,8 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
                     return None
                 return self._prepare_experience_candidate(
                     refs, recipe, operator, experience_snapshot,
-                    reserve_sample_order=reserve_sample_order)
+                    reserve_sample_order=reserve_sample_order,
+                    record_token_usage=record_token_usage)
 
             evaluated = self._collect_until_target(
                 prepare_one, target_size, on_evaluated=on_evaluated)
@@ -526,6 +628,9 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
                     parent_experiences[:] = retained
                     new_experiences.extend(copy.deepcopy(fresh))
         finally:
+            with token_usage_lock:
+                self.last_node_token_usage = self._merge_token_usage(
+                    token_usage_records)
             if isinstance(experiences, list):
                 experiences[:] = parent_experiences
             if manager is not None and hasattr(manager, "end_node"):

@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import ast
 import copy
+import threading
 from abc import abstractmethod
+from contextlib import contextmanager
 from typing import Any, List
 
 from .code import Program, Function, TextFunctionProgramConverter
@@ -36,6 +38,152 @@ class LLM:
         """
         self.do_auto_trim = do_auto_trim
         self.debug_mode = debug_mode
+        self._token_usage_local = threading.local()
+        self._token_usage_lock = threading.RLock()
+        self._token_usage_total = self.empty_token_usage()
+
+    @staticmethod
+    def empty_token_usage() -> dict:
+        return {
+            "calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "unknown_token_calls": 0,
+            "details": [],
+        }
+
+    @staticmethod
+    def _int_or_none(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def normalize_token_usage(cls, usage: Any) -> dict:
+        """Normalize OpenAI-compatible usage payloads to common token fields."""
+        if usage is None:
+            return {}
+        if hasattr(usage, "model_dump"):
+            usage = usage.model_dump()
+        elif hasattr(usage, "dict"):
+            usage = usage.dict()
+        elif not isinstance(usage, dict):
+            usage = {
+                name: getattr(usage, name, None)
+                for name in (
+                    "prompt_tokens", "completion_tokens", "total_tokens",
+                    "input_tokens", "output_tokens",
+                )
+            }
+        if not isinstance(usage, dict):
+            return {}
+
+        prompt_tokens = cls._int_or_none(
+            usage.get("prompt_tokens", usage.get("input_tokens")))
+        completion_tokens = cls._int_or_none(
+            usage.get("completion_tokens", usage.get("output_tokens")))
+        total_tokens = cls._int_or_none(usage.get("total_tokens"))
+        if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+            total_tokens = prompt_tokens + completion_tokens
+
+        normalized = {}
+        if prompt_tokens is not None:
+            normalized["prompt_tokens"] = prompt_tokens
+        if completion_tokens is not None:
+            normalized["completion_tokens"] = completion_tokens
+        if total_tokens is not None:
+            normalized["total_tokens"] = total_tokens
+        return normalized
+
+    @classmethod
+    def _single_token_usage(cls, usage: Any) -> dict:
+        normalized = cls.normalize_token_usage(usage)
+        record = cls.empty_token_usage()
+        record["calls"] = 1
+        has_token_count = False
+        detail = {}
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = cls._int_or_none(normalized.get(field))
+            detail[field] = value
+            if value is not None:
+                record[field] = value
+                has_token_count = True
+        if not has_token_count:
+            record["unknown_token_calls"] = 1
+        record["details"].append(detail)
+        return record
+
+    @classmethod
+    def merge_token_usage(cls, *usages: dict | None) -> dict:
+        merged = cls.empty_token_usage()
+        for usage in usages:
+            if not usage:
+                continue
+            if "calls" not in usage:
+                usage = cls._single_token_usage(usage)
+            merged["calls"] += cls._int_or_none(usage.get("calls")) or 0
+            merged["unknown_token_calls"] += (
+                cls._int_or_none(usage.get("unknown_token_calls")) or 0)
+            for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                merged[field] += cls._int_or_none(usage.get(field)) or 0
+            details = usage.get("details")
+            if isinstance(details, list):
+                merged["details"].extend(copy.deepcopy(details))
+        for phase in ("reflection", "evolution"):
+            phase_usages = [
+                usage.get(phase)
+                for usage in usages
+                if isinstance(usage, dict) and isinstance(usage.get(phase), dict)
+            ]
+            if phase_usages:
+                merged[phase] = cls.merge_token_usage(*phase_usages)
+        return merged
+
+    @classmethod
+    def compact_token_usage(cls, usage: dict | None) -> dict | None:
+        if not usage:
+            return None
+        if "calls" not in usage:
+            usage = cls._single_token_usage(usage)
+        compact = {
+            "prompt_tokens": cls._int_or_none(usage.get("prompt_tokens")) or 0,
+            "completion_tokens": cls._int_or_none(usage.get("completion_tokens")) or 0,
+        }
+        if compact["prompt_tokens"] == 0 and compact["completion_tokens"] == 0:
+            return None
+        return compact
+
+    @contextmanager
+    def capture_token_usage(self):
+        """Capture successful LLM call token usage in the current thread."""
+        usage = self.empty_token_usage()
+        stack = getattr(self._token_usage_local, "stack", None)
+        if stack is None:
+            stack = []
+            self._token_usage_local.stack = stack
+        stack.append(usage)
+        try:
+            yield usage
+        finally:
+            stack.pop()
+
+    def _record_token_usage(self, usage: Any = None) -> dict:
+        """Record one successful LLM call for active token-usage scopes."""
+        record = self._single_token_usage(usage)
+        with self._token_usage_lock:
+            self._token_usage_total = self.merge_token_usage(
+                self._token_usage_total, record)
+        for captured in getattr(self._token_usage_local, "stack", []) or []:
+            merged = self.merge_token_usage(captured, record)
+            captured.clear()
+            captured.update(merged)
+        return record
+
+    def get_token_usage_total(self) -> dict:
+        with self._token_usage_lock:
+            return copy.deepcopy(self._token_usage_total)
 
     @abstractmethod
     def draw_sample(self, prompt: str | Any, *args, **kwargs) -> str:

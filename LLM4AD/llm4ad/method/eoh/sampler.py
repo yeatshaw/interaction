@@ -25,7 +25,10 @@ class EoHSampler:
     def trim_thought_from_response(cls, response: str) -> str | None:
         try:
             match = re.search(r'(?is)\bthought\s*:\s*(\{.*?\})', response)
-            return match.group(1) if match else None
+            if match:
+                return match.group(1)
+            match = re.search(r'(?s)\{.*?\}', response)
+            return match.group(0) if match else None
         except:
             return None
 
