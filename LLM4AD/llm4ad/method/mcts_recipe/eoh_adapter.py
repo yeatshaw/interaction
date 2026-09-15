@@ -92,7 +92,8 @@ class EoHRecipeExpander:
         # falls back to the reference-only section.
         return list(getattr(ref, "_recipe_parent_functions", ()))
 
-    def _generation_prompt(self, refs, suggestion, operator):
+    def _generation_prompt(self, refs, suggestion, operator,
+                           include_suggestion=True):
         """Build an operator prompt without serializing LLM calls.
 
         ``EoHPrompt`` clears the copied Functions' docstrings while formatting
@@ -100,17 +101,23 @@ class EoHRecipeExpander:
         remains outside the lock and therefore runs in parallel.
         """
         with self._prompt_lock:
-            return self._generation_prompt_unlocked(refs, suggestion, operator)
+            return self._generation_prompt_unlocked(
+                refs, suggestion, operator, include_suggestion)
 
-    def _generation_prompt_unlocked(self, refs, suggestion, operator):
+    def _generation_prompt_unlocked(self, refs, suggestion, operator,
+                                    include_suggestion=True):
         if operator == "e1":
-            prompt = EoHPrompt.get_prompt_e1(refs, self.info, suggestion)
+            prompt = EoHPrompt.get_prompt_e1(
+                refs, self.info, suggestion, include_suggestion)
         elif operator == "e2":
-            prompt = EoHPrompt.get_prompt_e2(refs, self.info, suggestion)
+            prompt = EoHPrompt.get_prompt_e2(
+                refs, self.info, suggestion, include_suggestion)
         elif operator == "m1":
-            prompt = EoHPrompt.get_prompt_m1(refs[0], self.info, suggestion)
+            prompt = EoHPrompt.get_prompt_m1(
+                refs[0], self.info, suggestion, include_suggestion)
         else:
-            prompt = EoHPrompt.get_prompt_m2(refs[0], self.info, suggestion)
+            prompt = EoHPrompt.get_prompt_m2(
+                refs[0], self.info, suggestion, include_suggestion)
         return prompt
 
     def _prepare_candidate(self, refs, population, recipe, operator,
@@ -280,7 +287,8 @@ class EoHRecipeExpander:
         """Generate one child using the original EoH operator prompt."""
         try:
             refs = copy.deepcopy(list(refs))
-            prompt = self._generation_prompt(refs, None, operator)
+            prompt = self._generation_prompt(
+                refs, None, operator, include_suggestion=False)
             sample_start = time.time()
             thought, function = self.sampler.get_thought_and_function(prompt)
             if thought is None or function is None:
@@ -307,6 +315,57 @@ class EoHRecipeExpander:
     # The implementation below is retained for compatibility with code that
     # directly called the old methods.  Normal node expansion uses ``__call__``
     # and the strict two-stage batch path above.
+
+
+class NoReflectionEoHRecipeExpander(EoHRecipeExpander):
+    """Expand a recipe edge with EoH operators but no reflection prompt."""
+
+    def _prepare_candidate(self, refs, population, recipe, operator,
+                           reserve_sample_order=None):
+        sample_order = (reserve_sample_order()
+                        if reserve_sample_order is not None else None)
+        sample_start = time.time()
+        try:
+            refs = copy.deepcopy(list(refs))
+            prompt = self._generation_prompt(
+                refs, None, operator, include_suggestion=False)
+            thought, function = self.sampler.get_thought_and_function(prompt)
+            if thought is None or function is None:
+                return None
+            program = TextFunctionProgramConverter.function_to_program(
+                function, self.template_program)
+            if program is None:
+                return None
+        except Exception as exc:
+            if self.debug_mode:
+                print(f"DEBUG: candidate generation failed: {exc}")
+            return None
+
+        sample_time = time.time() - sample_start
+        function.algorithm = thought
+        function.sample_time = sample_time
+        function.operator = operator
+        function._eoh_parent_ids = tuple(
+            getattr(ref, "_recipe_algorithm_id", None) for ref in refs)
+        function._recipe_id = recipe.recipe_id
+        function._recipe_sample_order = sample_order
+        function._eoh_generation_suggestion = None
+        return {
+            "function": function,
+            "program": program,
+            "refs": refs,
+            "operator": operator,
+            "suggestion": None,
+            "sample_time": sample_time,
+        }
+
+    def __call__(self, population, recipe, selection_num, target_size,
+                 experiences=None, on_evaluated=None,
+                 reserve_sample_order=None):
+        return super().__call__(
+            population, recipe, selection_num, target_size,
+            on_evaluated=on_evaluated,
+            reserve_sample_order=reserve_sample_order)
 
 class RefineEvoRecipeExpander(EoHRecipeExpander):
     """Front-loaded RefineEvo-style experience retrieval and reflection.

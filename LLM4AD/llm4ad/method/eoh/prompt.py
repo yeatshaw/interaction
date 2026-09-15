@@ -520,8 +520,20 @@ This is the format for your reply:
 Do not give additional explanations.'''
         return prompt_content
 
+    @staticmethod
+    def _operator_guidance(suggestion: str | None, guided_instruction: str,
+                           unguided_instruction: str,
+                           include_suggestion: bool = True) -> str:
+        if include_suggestion:
+            return (f'These are some suggestions after reflecting on the given algorithms:\n'
+                    f'{suggestion}\n'
+                    f'{guided_instruction}')
+        return unguided_instruction
+
     @classmethod
-    def get_prompt_e1(cls, indivs: List[Function], info: dict | None = None, suggestion: str | None = None):
+    def get_prompt_e1(cls, indivs: List[Function], info: dict | None = None,
+                      suggestion: str | None = None,
+                      include_suggestion: bool = True):
         method_name, method_args, func_template, class_args = cls._template_values(info)
         task_prompt = info['task_description']
         for indi in indivs:
@@ -531,6 +543,12 @@ Do not give additional explanations.'''
         for i, indi in enumerate(indivs):
             indi.docstring = ''
             indivs_prompt += f'No. {i + 1} method and the corresponding code are:\n{indi.algorithm}\n{str(indi)}'
+        guidance = cls._operator_guidance(
+            suggestion,
+            'Please refer to the given suggestions and help me create a new algorithm that has a totally different form from the given ones.',
+            'Please help me create a new algorithm that has a totally different form from the given ones.',
+            include_suggestion,
+        )
         # create prmpt content
         prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
 I have {len(indivs)} implementations of this method with their codes as follows:
@@ -539,16 +557,15 @@ I have {len(indivs)} implementations of this method with their codes as follows:
 {method_args}
 This is the format for your reply:
 {func_template}
-These are some suggestions after reflecting on the given algorithms:
-{suggestion}
-Please refer to the given suggestions and help me create a new algorithm that has a totally different form from the given ones. 
+{guidance}
 {cls.requirements()}
 Do not give additional explanations.'''
         return prompt_content
 
     @classmethod
     def get_prompt_e2(cls, indivs: List[Function], info: dict | None = None,
-                      suggestion: str | None = None):
+                      suggestion: str | None = None,
+                      include_suggestion: bool = True):
         method_name, method_args, func_template, class_args = cls._template_values(info)
         task_prompt = info['task_description']
         for indi in indivs:
@@ -559,6 +576,12 @@ Do not give additional explanations.'''
         for i, indi in enumerate(indivs):
             indi.docstring = ''
             indivs_prompt += f'No. {i + 1} method and the corresponding code are:\n{indi.algorithm}\n{str(indi)}'
+        guidance = cls._operator_guidance(
+            suggestion,
+            'Please refer to the given suggestions and identify the common backbone idea in the provided methods and help me create a new algorithm that has a totally different form from the given ones but can be motivated from them.',
+            'Please identify the common backbone idea in the provided methods and help me create a new algorithm that has a totally different form from the given ones but can be motivated from them.',
+            include_suggestion,
+        )
         # create prmpt content
         prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
 I have {len(indivs)} implementations of this method with their codes as follows:
@@ -567,20 +590,25 @@ I have {len(indivs)} implementations of this method with their codes as follows:
 {method_args}
 This is the format for your reply:
 {func_template}
-These are some suggestions after reflecting on the given algorithms:
-{suggestion}
-Please refer to the given suggestions and identify the common backbone idea in the provided methods and help me create a new algorithm that has a totally different form from the given ones but can be motivated from them.
+{guidance}
 {cls.requirements()}
 Do not give additional explanations.'''
         return prompt_content
 
     @classmethod
     def get_prompt_m1(cls, indi: Function, info: dict | None = None,
-                      suggestion: str | None = None):
+                      suggestion: str | None = None,
+                      include_suggestion: bool = True):
         method_name, method_args, func_template, class_args = cls._template_values(info)
         task_prompt = info['task_description']
         assert hasattr(indi, 'algorithm')
         indiv_prompt = f'{indi.algorithm}\n{str(indi)}'
+        guidance = cls._operator_guidance(
+            suggestion,
+            'Please refer to the given suggestions and assist me in creating a new algorithm that has a different form but can be a modified version of the algorithm provided.',
+            'Please assist me in creating a new algorithm that has a different form but can be a modified version of the algorithm provided.',
+            include_suggestion,
+        )
 
         # create prmpt content
         prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
@@ -590,20 +618,25 @@ I have a implementation of this method with its code as follows:
 {method_args}
 This is the format for your reply:
 {func_template}
-These are some suggestions after reflecting on the given algorithms:
-{suggestion}
-Please refer to the given suggestions and assist me in creating a new algorithm that has a different form but can be a modified version of the algorithm provided.
+{guidance}
 {cls.requirements()}
 Do not give additional explanations.'''
         return prompt_content
 
     @classmethod
     def get_prompt_m2(cls, indi: Function, info: dict | None = None,
-                      suggestion: str | None = None):
+                      suggestion: str | None = None,
+                      include_suggestion: bool = True):
         method_name, method_args, func_template, class_args = cls._template_values(info)
         task_prompt = info['task_description']
         assert hasattr(indi, 'algorithm')
         indiv_prompt = f'{indi.algorithm}\n{str(indi)}'
+        guidance = cls._operator_guidance(
+            suggestion,
+            'Please refer to the given suggestions and identify the main algorithm parameters and assist me in creating a new algorithm that has a different parameter settings of the score function provided.',
+            'Please identify the main algorithm parameters and assist me in creating a new algorithm that has a different parameter settings of the score function provided.',
+            include_suggestion,
+        )
         # create prmpt content
         prompt_content = f'''{task_prompt} You need to optimize the method '{method_name}' in it.
 I have a implementation of this method with its code as follows:
@@ -612,9 +645,7 @@ I have a implementation of this method with its code as follows:
 {method_args}
 This is the format for your reply:
 {func_template}
-These are some suggestions after reflecting on the given algorithms:
-{suggestion}
-Please refer to the given suggestions and identify the main algorithm parameters and assist me in creating a new algorithm that has a different parameter settings of the score function provided.
-        {cls.requirements()}
+{guidance}
+{cls.requirements()}
 Do not give additional explanations.'''
         return prompt_content

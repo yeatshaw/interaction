@@ -18,6 +18,7 @@ from llm4ad.method.eoh.sampler import EoHSampler
 from llm4ad.method.mcts_recipe import (
     EoHRecipeExpander,
     MCTSRecipe,
+    NoReflectionEoHRecipeExpander,
     RefineEvoRecipeExpander,
     RefineEvoExperienceManager,
     get_default_recipes,
@@ -137,30 +138,46 @@ def run_task(*, method_name, template_module, evaluation, llm,
     store_dir.mkdir(parents=True, exist_ok=True)
     print(f"Recipe-MCTS output directory: {store_dir}", flush=True)
     recipes = get_default_recipes()
-    embedding_host = os.environ.get(
-        "LLM4AD_EMBEDDING_BASE_URL",
-        "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    embedding = OpenAIEmbedding(
-        api_key=os.environ.get("LLM4AD_EMBEDDING_API_KEY",
-                               os.environ.get("OPENAI_API_KEY8",
-                                              os.environ.get("LLM4AD_API_KEY", ""))),
-        base_url=embedding_host,
-        model=os.environ.get(
-            "LLM4AD_EMBEDDING_MODEL", "text-embedding-v4"),
-        encoding_format=os.environ.get(
-            "LLM4AD_EMBEDDING_ENCODING_FORMAT", "float"),
-    )
-    experience_manager = RefineEvoExperienceManager(
-        reflector_llm=llm,
-        embedding_model=embedding,
-        top_k=int(recipes["refineevo_experience"]["experience_top_k"]),
-    )
+    mode = os.environ.get(
+        "LLM4AD_MCTS_RECIPE_MODE",
+        "no_reflection" if os.environ.get("LLM4AD_NO_REFLECTION", "0") == "1"
+        else "reflection",
+    ).strip().lower()
+    if mode not in {"reflection", "no_reflection"}:
+        raise ValueError(
+            "LLM4AD_MCTS_RECIPE_MODE must be 'reflection' or 'no_reflection'")
+    print(f"Recipe-MCTS mode: {mode}", flush=True)
+
+    experience_manager = None
+    if mode == "reflection":
+        embedding_host = os.environ.get(
+            "LLM4AD_EMBEDDING_BASE_URL",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        embedding = OpenAIEmbedding(
+            api_key=os.environ.get(
+                "LLM4AD_EMBEDDING_API_KEY",
+                os.environ.get("OPENAI_API_KEY8",
+                               os.environ.get("LLM4AD_API_KEY", ""))),
+            base_url=embedding_host,
+            model=os.environ.get(
+                "LLM4AD_EMBEDDING_MODEL", "text-embedding-v4"),
+            encoding_format=os.environ.get(
+                "LLM4AD_EMBEDDING_ENCODING_FORMAT", "float"),
+        )
+        experience_manager = RefineEvoExperienceManager(
+            reflector_llm=llm,
+            embedding_model=embedding,
+            top_k=int(recipes["refineevo_experience"]["experience_top_k"]),
+        )
     expanders = {}
     for recipe_id, recipe in recipes.items():
-        cls = (RefineEvoRecipeExpander
-               if recipe["refineevo_experience"] else EoHRecipeExpander)
+        if mode == "no_reflection":
+            cls = NoReflectionEoHRecipeExpander
+        else:
+            cls = (RefineEvoRecipeExpander
+                   if recipe["refineevo_experience"] else EoHRecipeExpander)
         kwargs = {}
-        if recipe["refineevo_experience"]:
+        if mode == "reflection" and recipe["refineevo_experience"]:
             kwargs.update(
                 retrieve_experiences=experience_manager.retrieve,
                 distill_experience=experience_manager.distill,
