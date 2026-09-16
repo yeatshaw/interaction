@@ -1,67 +1,49 @@
 param(
     [string]$PythonExe = "python",
-    [string]$TrainData = $env:LLM4AD_TSP_TRAIN_DATA,
-    [string]$ExperimentDir = "",
-    [string]$LogRoot = ""
+    [string]$TaskScript = (Join-Path $PSScriptRoot "run_mcts_recipe.py"),
+    [string]$LogDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-$ScriptPath = Join-Path $PSScriptRoot "run_mcts_recipe.py"
-$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
+$TaskScript = (Resolve-Path -LiteralPath $TaskScript).Path
+$RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..\..\..")).Path
 
-if (-not (Test-Path -LiteralPath $ScriptPath)) {
-    throw "Target script not found: $ScriptPath"
+if (-not $LogDir) {
+    $LogDir = Join-Path $RepoRoot "logs\background"
 }
-
-Get-Command $PythonExe -ErrorAction Stop | Out-Null
-
-if (-not $LogRoot) {
-    $LogRoot = Join-Path $ProjectRoot "logs\background_mcts_recipe_tsp_reflection_recipes"
-}
-
-New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null
+New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
 
 $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-if (-not $ExperimentDir) {
-    $ExperimentDir = Join-Path $ProjectRoot "logs\mcts_recipe_tsp_reflection_recipes_$Timestamp"
-}
-New-Item -ItemType Directory -Force -Path $ExperimentDir | Out-Null
-
-# Use all Recipe-MCTS recipes and all EoH evolution operators.
-$env:LLM4AD_MCTS_RECIPE_MODE = "reflection"
-$env:LLM4AD_NO_REFLECTION = "0"
-$env:LLM4AD_LOG_DIR = $ExperimentDir
-$env:LLM4AD_OPERATORS = "e1,e2,m1,m2"
-
-$StdoutLog = Join-Path $LogRoot "mcts_recipe_tsp_$Timestamp.out.log"
-$StderrLog = Join-Path $LogRoot "mcts_recipe_tsp_$Timestamp.err.log"
-$PidFile = Join-Path $LogRoot "mcts_recipe_tsp_$Timestamp.pid"
-
-$Arguments = @("-u", "`"$ScriptPath`"")
-if ($TrainData) {
-    $Arguments += @("--train-data", "`"$TrainData`"")
-}
+$StdOut = Join-Path $LogDir "tsp_mcts_recipe_$Timestamp.log"
+$StdErr = Join-Path $LogDir "tsp_mcts_recipe_${Timestamp}_error.log"
 
 $Process = Start-Process `
     -FilePath $PythonExe `
-    -ArgumentList $Arguments `
-    -WorkingDirectory $ProjectRoot `
-    -RedirectStandardOutput $StdoutLog `
-    -RedirectStandardError $StderrLog `
+    -ArgumentList @("`"$TaskScript`"") `
+    -WorkingDirectory $RepoRoot `
     -WindowStyle Hidden `
+    -RedirectStandardOutput $StdOut `
+    -RedirectStandardError $StdErr `
     -PassThru
 
-$Process.Id | Set-Content -LiteralPath $PidFile -Encoding ASCII
+$LaunchInfo = [ordered]@{
+    pid = $Process.Id
+    python = $PythonExe
+    task_script = $TaskScript
+    working_directory = $RepoRoot
+    stdout_log = $StdOut
+    stderr_log = $StdErr
+    config_file = (Join-Path $PSScriptRoot "mcts_recipe_config.py")
+    started_at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+}
 
-[pscustomobject]@{
-    Pid = $Process.Id
-    Script = $ScriptPath
-    WorkingDirectory = $ProjectRoot
-    Mode = $env:LLM4AD_MCTS_RECIPE_MODE
-    Operators = $env:LLM4AD_OPERATORS
-    ExperimentDir = $ExperimentDir
-    StdoutLog = $StdoutLog
-    StderrLog = $StderrLog
-    PidFile = $PidFile
-} | Format-List
+$LaunchJson = Join-Path $LogDir "tsp_mcts_recipe_${Timestamp}_launch.json"
+$LaunchInfo | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $LaunchJson -Encoding UTF8
+
+Write-Host "Started TSP Recipe-MCTS background run."
+Write-Host "PID: $($Process.Id)"
+Write-Host "Config: $($LaunchInfo.config_file)"
+Write-Host "Stdout: $StdOut"
+Write-Host "Stderr: $StdErr"
+Write-Host "Launch JSON: $LaunchJson"

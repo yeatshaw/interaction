@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import concurrent.futures
 import math
-import os
 import threading
 import time
 from contextlib import nullcontext
@@ -13,6 +12,7 @@ from contextlib import nullcontext
 from ..eoh.prompt import EoHPrompt
 from ..eoh.sampler import EoHSampler
 from ...base import TextFunctionProgramConverter, SecureEvaluator
+from .budget import SampleBudgetExhausted
 
 
 class EoHRecipeExpander:
@@ -32,15 +32,14 @@ class EoHRecipeExpander:
                                          **evaluator_kwargs)
         self.num_samplers = max(1, int(num_samplers))
         self.num_evaluators = max(1, int(num_evaluators))
-        configured = operators if operators is not None else os.environ.get(
-            "LLM4AD_OPERATORS", "e1,e2,m1,m2")
+        configured = operators if operators is not None else "e1,e2,m1,m2"
         if isinstance(configured, str):
             configured = [x.strip() for x in configured.split(",") if x.strip()]
         self.operators = tuple(configured)
         invalid = set(self.operators) - {"e1", "e2", "m1", "m2"}
         if not self.operators or invalid:
             raise ValueError(
-                f"LLM4AD_OPERATORS must contain e1/e2/m1/m2, got {self.operators}")
+                f"operators must contain e1/e2/m1/m2, got {self.operators}")
         # Sampling and evaluation use separate pools. Each sampling worker runs
         # an EoH-style pipeline and waits only for its own evaluation before it
         # decides whether another sample is still needed.
@@ -77,17 +76,32 @@ class EoHRecipeExpander:
         return usage or None
 
     def _merge_token_usage(self, usages):
-        empty = {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-        }
+        """Merge token usage into one total record.
+
+        Reflection and evolution calls are intentionally combined here.  The
+        individual algorithm/node records only need the aggregate input and
+        output counts; cumulative totals are written into checkpoints by the
+        MCTS store.
+        """
         merge = getattr(self.sampler.llm, "merge_token_usage", None)
         if callable(merge):
-            return self._compact_token_usage(merge(*usages)) or empty.copy()
-        return {
-            "prompt_tokens": sum(int(item.get("prompt_tokens", 0)) for item in usages if item),
-            "completion_tokens": sum(int(item.get("completion_tokens", 0)) for item in usages if item),
-        }
+            merged = merge(*(usage for usage in usages if usage))
+            compact = self._compact_token_usage(merged)
+        else:
+            compact = None
+        if compact is None:
+            compact = {
+                "prompt_tokens": sum(
+                    int((usage or {}).get("prompt_tokens", 0))
+                    for usage in usages),
+                "completion_tokens": sum(
+                    int((usage or {}).get("completion_tokens", 0))
+                    for usage in usages),
+            }
+        compact["total_tokens"] = (
+            int(compact.get("prompt_tokens", 0))
+            + int(compact.get("completion_tokens", 0)))
+        return compact
 
     def _record_attempt_token_usage(self, usage, recorder):
         token_usage = self._compact_token_usage(usage)
@@ -277,7 +291,10 @@ class EoHRecipeExpander:
                 with result_lock:
                     if len(evaluated) >= target_size:
                         return
-                candidate = prepare_one()
+                try:
+                    candidate = prepare_one()
+                except SampleBudgetExhausted:
+                    return
                 if candidate is None:
                     continue
                 result = self._evaluate_candidates(

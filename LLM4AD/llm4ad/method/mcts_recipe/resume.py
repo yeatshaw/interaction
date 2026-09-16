@@ -53,6 +53,7 @@ def function_from_record(record, template_program=None):
     function.evaluate_time = record.get("evaluate_time")
     function.sample_time = record.get("sample_time")
     function._recipe_token_usage = record.get("token_usage")
+    function._recipe_sample_order = record.get("sample_order")
     function._recipe_id = record.get("recipe_id")
     return function
 

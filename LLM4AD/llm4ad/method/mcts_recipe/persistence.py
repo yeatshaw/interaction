@@ -36,6 +36,7 @@ class RecipeStore:
             "evaluate_time": getattr(individual, "evaluate_time", None),
             "sample_time": getattr(individual, "sample_time", None),
             "token_usage": getattr(individual, "_recipe_token_usage", None),
+            "sample_order": getattr(individual, "_recipe_sample_order", None),
             "code": (individual.to_code_without_docstring()
                      if hasattr(individual, "to_code_without_docstring")
                      else str(individual)),
@@ -148,6 +149,40 @@ class RecipeStore:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(records, f, ensure_ascii=False, indent=2)
             os.replace(tmp, self.best_sample_path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    @property
+    def elite_pool_path(self):
+        return os.path.join(self.directory, "global_elite_pool.json")
+
+    def load_elite_pool_records(self):
+        try:
+            with open(self.elite_pool_path, encoding="utf-8") as f:
+                payload = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        if isinstance(payload, dict):
+            records = payload.get("algorithms", [])
+        elif isinstance(payload, list):
+            records = payload
+        else:
+            records = []
+        return records if isinstance(records, list) else []
+
+    def write_elite_pool(self, individuals, elite_pool_size):
+        """Atomically replace the optional global elite algorithm pool."""
+        payload = {
+            "elite_pool_size": int(elite_pool_size),
+            "population_size": len(individuals),
+            "algorithms": [self._algorithm_record(x) for x in individuals],
+        }
+        fd, tmp = tempfile.mkstemp(prefix=".global_elite_pool_", dir=self.directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.elite_pool_path)
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)

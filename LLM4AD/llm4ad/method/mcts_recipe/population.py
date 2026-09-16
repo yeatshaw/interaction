@@ -22,10 +22,41 @@ class RecipePopulation:
         return RecipePopulation(copy.deepcopy(self.individuals), self.pop_size,
                                 self.generation)
 
+    @staticmethod
+    def valid_individuals(individuals):
+        return [x for x in individuals
+                if getattr(x, "score", None) is not None
+                and math.isfinite(float(x.score))]
+
+    @classmethod
+    def best_unique(cls, individuals, limit=None):
+        # Same direction as EoH: score is maximized (usually negative cost).
+        candidates = cls.valid_individuals(individuals)
+        candidates.sort(key=lambda x: getattr(x, "score", float("-inf")),
+                        reverse=True)
+        unique, seen = [], set()
+        for item in candidates:
+            code = str(item)
+            if code in seen:
+                continue
+            seen.add(code)
+            unique.append(item)
+            if limit is not None and len(unique) >= int(limit):
+                break
+        return unique
+
+    def with_extra_reference_individuals(self, extra_individuals):
+        """Return a selection-only population containing local and elite refs."""
+        combined = self.best_unique(
+            list(self.individuals) + list(extra_individuals),
+            limit=None,
+        )
+        return RecipePopulation(copy.deepcopy(combined),
+                                max(self.pop_size, len(combined)),
+                                self.generation)
+
     def select_many(self, count):
-        valid = [x for x in self.individuals
-                 if getattr(x, "score", None) is not None
-                 and math.isfinite(float(x.score))]
+        valid = self.valid_individuals(self.individuals)
         if count < 1 or count > len(valid):
             raise ValueError(f"selection_num={count} exceeds population size {len(valid)}")
         valid.sort(key=lambda x: x.score, reverse=True)
@@ -34,20 +65,8 @@ class RecipePopulation:
         return list(np.random.choice(valid, size=count, replace=False, p=p))
 
     def survival(self, offspring):
-        # Same direction as EoH: score is maximized (usually negative cost).
-        candidates = [
-            item for item in self.individuals + list(offspring)
-            if getattr(item, "score", None) is not None
-            and math.isfinite(float(item.score))
-        ]
-        candidates.sort(key=lambda x: getattr(x, "score", float("-inf")), reverse=True)
-        unique, seen = [], set()
-        for item in candidates:
-            code = str(item)
-            if code in seen:
-                continue
-            seen.add(code)
-            unique.append(item)
+        unique = self.best_unique(self.individuals + list(offspring),
+                                  self.pop_size)
         return RecipePopulation(unique[:self.pop_size], self.pop_size,
                                 self.generation + 1)
 

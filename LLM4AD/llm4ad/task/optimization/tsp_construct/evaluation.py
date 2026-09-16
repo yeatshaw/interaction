@@ -11,7 +11,7 @@ import numpy as np
 from llm4ad.base import Evaluation
 from .get_instance import GetData
 
-__all__ = ["TSPEvaluation"]
+__all__ = ["TSPEvaluation", "RefineEVOTSPEvaluation"]
 
 
 class TSPEvaluation(Evaluation):
@@ -136,3 +136,50 @@ class TSPEvaluation(Evaluation):
         if not distances or any(value is None for value in distances):
             return None
         return -float(np.mean(distances))
+
+
+class RefineEVOTSPEvaluation(TSPEvaluation):
+    """RefineEvo-compatible TSP evaluation with the LLM4AD score direction.
+
+    RefineEvo rebuilds the Euclidean distance matrix from coordinates for each
+    instance and sums the closed tour length.  This adapter keeps that route
+    evaluation unchanged, but returns ``-mean_distance`` so MCTS/EoH can still
+    maximize the score.  ``TSPEvaluation`` remains available for the original
+    stored-distance-matrix behavior.
+    """
+
+    @staticmethod
+    def _evaluate_data(heuristic, data):
+        from scipy.spatial import distance_matrix
+
+        coordinates, _ = data
+        coordinates = np.asarray(coordinates, dtype=float)
+        dist_mat = distance_matrix(coordinates, coordinates)
+        problem_size = coordinates.shape[0]
+        start_node = 0
+        solution = [start_node]
+        unvisited = set(range(problem_size))
+        unvisited.remove(start_node)
+
+        for _ in range(problem_size - 1):
+            try:
+                next_node = int(heuristic(
+                    current_node=solution[-1],
+                    destination_node=start_node,
+                    unvisited_nodes=set(unvisited),
+                    distance_matrix=dist_mat.copy(),
+                ))
+            except (TypeError, ValueError, IndexError, OverflowError,
+                    ZeroDivisionError, FloatingPointError, RuntimeWarning):
+                return None
+            if next_node not in unvisited:
+                return None
+            solution.append(next_node)
+            unvisited.remove(next_node)
+
+        return_node_distance = dist_mat[solution[-1], start_node]
+        distance = sum(
+            dist_mat[solution[index], solution[index + 1]]
+            for index in range(len(solution) - 1)
+        ) + return_node_distance
+        return float(distance) if np.isfinite(distance) else None
