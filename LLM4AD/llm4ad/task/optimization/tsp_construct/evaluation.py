@@ -21,6 +21,8 @@ class TSPEvaluation(Evaluation):
                  dataset_path: str | Path | None = None, seed=2024, **kwargs):
         super().__init__(use_numba_accelerate=False,
                          timeout_seconds=timeout_seconds)
+        strict_recipe_dataset_format = bool(
+            kwargs.pop("strict_recipe_dataset_format", False))
         dataset_path = dataset_path or os.environ.get("LLM4AD_TSP_TRAIN_DATA")
         if dataset_path:
             with Path(dataset_path).expanduser().open("rb") as file:
@@ -28,9 +30,34 @@ class TSPEvaluation(Evaluation):
         else:
             datasets = GetData(n_instance, problem_size, seed=seed).generate_instances()
 
-        self._datasets = self._validate_datasets(datasets)
+        validator = (self._validate_recipe_datasets
+                     if strict_recipe_dataset_format
+                     else self._validate_datasets)
+        self._datasets = validator(datasets)
         self.n_instance = len(self._datasets)
         self.problem_size = len(self._datasets[0][0])
+
+    @staticmethod
+    def _validate_recipe_datasets(datasets):
+        if not isinstance(datasets, (list, tuple)) or not datasets:
+            raise ValueError("TSP dataset must be a non-empty list of instance pairs.")
+        validated = []
+        for index, item in enumerate(datasets):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                raise ValueError(
+                    f"TSP instance {index} must be (coordinates, distance_matrix).")
+            coordinates = np.asarray(item[0], dtype=float)
+            distance_matrix = np.asarray(item[1], dtype=float)
+            city_count = len(coordinates)
+            if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+                raise ValueError(f"TSP instance {index} coordinates must have shape [n, 2].")
+            if city_count < 2 or distance_matrix.shape != (city_count, city_count):
+                raise ValueError(
+                    f"TSP instance {index} has an invalid distance matrix shape.")
+            if not np.all(np.isfinite(coordinates)) or not np.all(np.isfinite(distance_matrix)):
+                raise ValueError(f"TSP instance {index} contains non-finite values.")
+            validated.append((coordinates, distance_matrix))
+        return validated
 
     @staticmethod
     def _validate_datasets(datasets):

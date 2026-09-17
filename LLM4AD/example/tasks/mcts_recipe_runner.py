@@ -113,6 +113,10 @@ def evaluation_config(config):
     return _section(config, "evaluation")
 
 
+def test_config(config):
+    return _section(config, "test")
+
+
 def _operators(config):
     configured = (config or {}).get("operators", ("e1", "e2", "m1", "m2"))
     if isinstance(configured, str):
@@ -187,6 +191,65 @@ def write_experiment_config_snapshot(
     return path
 
 
+def _configured_paths(value):
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [value]
+    return list(value)
+
+
+def _resolve_configured_path(path, base_dir):
+    path = Path(path)
+    return path if path.is_absolute() else Path(base_dir) / path
+
+
+def run_post_training_test(task_type, store_dir, config):
+    config = dict(config or {})
+    if not config or not config.get("enabled", False):
+        return []
+    task_type = str(config.get("task") or task_type or "").lower()
+    if not task_type:
+        raise ValueError("test.task is required when post-training test is enabled")
+    data_paths = _configured_paths(
+        config.get("data_paths", config.get("data", config.get("dataset_path"))))
+    if not data_paths:
+        raise ValueError("test.data_paths is required when post-training test is enabled")
+    repository_root = _repo_root()
+    data_paths = [_resolve_configured_path(path, repository_root)
+                  for path in data_paths]
+    output = config.get("output")
+    if output is not None:
+        output = _resolve_configured_path(output, store_dir)
+    max_nodes = int(config.get("max_nodes", 0) or 0)
+    instance_timeout = int(config.get("instance_timeout", 1800) or 0)
+
+    from example.tasks.evaluate_best_test import evaluate_best_experiment
+
+    print(
+        f"Post-training test: task={task_type} "
+        f"datasets={len(data_paths)}",
+        flush=True,
+    )
+    generated = evaluate_best_experiment(
+        task_type,
+        store_dir,
+        data_paths,
+        output=output,
+        max_nodes=max_nodes,
+        instance_timeout=instance_timeout,
+    )
+    summary_path = Path(store_dir) / "post_training_test_results.json"
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump({
+            "task": task_type,
+            "data_paths": [str(path) for path in data_paths],
+            "output_files": [str(path) for path in generated],
+        }, f, ensure_ascii=False, indent=2)
+    print(f"Post-training test results: {summary_path}", flush=True)
+    return generated
+
+
 def _refineevo_initial_prompt(info, template_module):
     # The initialization assets are local to LLM4AD; no runtime dependency on
     # the separate RefineEvo checkout is allowed.
@@ -239,6 +302,87 @@ def _token_usage_helpers(llm):
         return usage
 
     return capture_token_usage, record_token_usage, merge_token_usage
+
+
+def _initial_population_eoh_recipe(llm, evaluation, info, pop_size,
+                                   selection_num=2, num_samplers=1,
+                                   debug=False, on_evaluated=None,
+                                   reserve_sample_order=None):
+    """Generate the root population with recipe-branch EoH semantics.
+
+    This path is used only for the compatibility mode requested by experiments
+    that set initialization_mode=eoh/original and disable the global elite pool.
+    It intentionally keeps the original recipe branch's sampling loop, parser,
+    acceptance order, and retention behavior.  The current branch's token usage
+    capture is preserved because it does not change the sampled population.
+    """
+    sampler = EoHSampler(llm, info["template_program"])
+    evaluator = SecureEvaluator(evaluation, debug_mode=debug)
+    individuals = []
+    prompt = EoHPrompt.get_prompt_i1(info)
+    max_attempts = int(pop_size) * 2
+    capture_token_usage, record_token_usage, merge_token_usage = (
+        _token_usage_helpers(llm))
+
+    def sample_one():
+        sample_order = (reserve_sample_order()
+                        if reserve_sample_order is not None else None)
+        sample_start = time.time()
+        evolution_usage = None
+        token_usage = None
+        try:
+            with capture_token_usage() as evolution_usage:
+                thought, function = sampler.get_recipe_thought_and_function(
+                    prompt)
+        finally:
+            token_usage = record_token_usage(evolution_usage)
+        sample_time = time.time() - sample_start
+        if thought is None or function is None:
+            return None
+        program = TextFunctionProgramConverter.function_to_program(
+            function, info["template_program"])
+        if program is None:
+            return None
+        score, eval_time = evaluator.evaluate_program_record_time(program)
+        if score is None or not isinstance(score, (int, float)) \
+                or not math.isfinite(float(score)):
+            if debug and score is not None:
+                print(f"DEBUG: rejected non-finite initialization score: {score}")
+            return None
+        function.algorithm = thought
+        function.score = score
+        function.evaluate_time = eval_time
+        function.sample_time = sample_time
+        function._recipe_token_usage = token_usage
+        function.operator = "i1"
+        function._recipe_sample_order = sample_order
+        if on_evaluated is not None:
+            on_evaluated(function)
+        return function
+
+    attempts = 0
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, int(num_samplers))) as executor:
+        while len(individuals) < int(pop_size) and attempts < max_attempts:
+            batch_size = min(max(1, int(num_samplers)),
+                             max_attempts - attempts)
+            attempts += batch_size
+            for function in executor.map(lambda _: sample_one(),
+                                         range(batch_size)):
+                if function is not None and len(individuals) < int(pop_size):
+                    individuals.append(function)
+                    print(f"Initialized root individual "
+                          f"{len(individuals)}/{pop_size}, "
+                          f"score={function.score}")
+    if len(individuals) < selection_num:
+        raise RuntimeError(
+            f"Initialization produced only {len(individuals)} feasible "
+            f"algorithms after {max_attempts} samples; at least "
+            f"{selection_num} are required")
+    if len(individuals) < int(pop_size):
+        print(f"Initialization stopped after {max_attempts} samples with "
+              f"{len(individuals)}/{pop_size} feasible algorithms")
+    return individuals, merge_token_usage()
 
 
 def _initial_population_eoh(llm, evaluation, info, pop_size, selection_num=2,
@@ -522,7 +666,8 @@ def run_task(*, method_name, template_module, evaluation, llm,
              embedding_config=None, exploration_constant=0.1,
              depth_balance_weight=0.2, node_batch_size=10, seed=None,
              experiment_config=None, initialization_mode="refineevo",
-             initial_sample_nums_max=None):
+             initial_sample_nums_max=None, task_type=None,
+             post_training_test_config=None):
     from example.tasks.utils import get_info
 
     info = get_info(method_name, template_module)
@@ -579,6 +724,8 @@ def run_task(*, method_name, template_module, evaluation, llm,
             "depth_balance_weight": depth_balance_weight,
             "node_batch_size": node_batch_size,
             "seed": seed,
+            "task_type": task_type,
+            "post_training_test_config": post_training_test_config,
         },
         recipes=recipes,
     )
@@ -648,13 +795,21 @@ def run_task(*, method_name, template_module, evaluation, llm,
             init_callback = lambda function: method.record_evaluated_sample(
                 function, population_node_id=1, depth=0)
             if initialization_mode in {"eoh", "original"}:
-                initial, initial_token_usage = _initial_population_eoh(
-                    llm, evaluation, info, pop_size, selection_num,
-                    num_samplers, debug,
-                    on_evaluated=init_callback,
-                    reserve_sample_order=method.reserve_sample_order,
-                    initial_sample_nums_max=initial_sample_nums_max,
-                )
+                if elite_pool_size == 0:
+                    initial, initial_token_usage = _initial_population_eoh_recipe(
+                        llm, evaluation, info, pop_size, selection_num,
+                        num_samplers, debug,
+                        on_evaluated=init_callback,
+                        reserve_sample_order=method.reserve_sample_order,
+                    )
+                else:
+                    initial, initial_token_usage = _initial_population_eoh(
+                        llm, evaluation, info, pop_size, selection_num,
+                        num_samplers, debug,
+                        on_evaluated=init_callback,
+                        reserve_sample_order=method.reserve_sample_order,
+                        initial_sample_nums_max=initial_sample_nums_max,
+                    )
             else:
                 initial, initial_token_usage = _initial_population(
                     llm, evaluation, info, pop_size, selection_num,
@@ -663,13 +818,15 @@ def run_task(*, method_name, template_module, evaluation, llm,
                     reserve_sample_order=method.reserve_sample_order,
                     init_pop_size=init_pop_size,
                 )
-        return method.run(
+        result = method.run(
             initial_individuals=initial,
             checkpoint=checkpoint,
             # Root samples were already recorded by the callback above.
             initial_samples_recorded=(checkpoint is None),
             initial_token_usage=(None if checkpoint else initial_token_usage),
         )
+        run_post_training_test(task_type, store_dir, post_training_test_config)
+        return result
     finally:
         for expander in expanders.values():
             expander.close(close_llm=False)
@@ -716,4 +873,5 @@ def common_options(default_log, config=None):
         "node_batch_size": int(mcts_config.get("node_batch_size", 10)),
         "seed": mcts_config.get("seed"),
         "experiment_config": config,
+        "post_training_test_config": test_config(config),
     }

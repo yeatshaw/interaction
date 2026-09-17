@@ -45,4 +45,12 @@ MCTS_RECIPE_CONFIG = {
         "dataset_path": '/public/home/liuyang/dataset/tsp/tsp_instances_train_100.pkl',
         "seed": 2024,
     },
+    "test": {
+        "enabled": False,
+        "task": "tsp",
+        "data_paths": [],
+        "output": "tsp_test_results.csv",
+        "max_nodes": 0,
+        "instance_timeout": 1800,
+    },
 }

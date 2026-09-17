@@ -43,4 +43,12 @@ MCTS_RECIPE_CONFIG = {
         "n_instance": 50,
         "dataset_path": None,
     },
+    "test": {
+        "enabled": False,
+        "task": "vrptw",
+        "data_paths": [],
+        "output": "vrptw_test_results.csv",
+        "max_nodes": 0,
+        "instance_timeout": 1800,
+    },
 }

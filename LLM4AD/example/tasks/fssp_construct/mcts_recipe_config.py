@@ -43,4 +43,12 @@ MCTS_RECIPE_CONFIG = {
         "n_jobs": 50,
         "n_machines": 20,
     },
+    "test": {
+        "enabled": False,
+        "task": "",
+        "data_paths": [],
+        "output": "test_results.csv",
+        "max_nodes": 0,
+        "instance_timeout": 1800,
+    },
 }

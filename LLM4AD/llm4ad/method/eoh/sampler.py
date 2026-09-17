@@ -21,6 +21,22 @@ class EoHSampler:
         function = SampleTrimmer.sample_to_function(code, self._template_program)
         return thought, function
 
+    def get_recipe_thought_and_function(self, prompt: str) -> Tuple[str, Function]:
+        response = self.llm.draw_sample(prompt)
+        thought = self.__class__.trim_recipe_thought_from_response(response)
+        code = self.__class__.trim_code_from_response(response)
+
+        function = SampleTrimmer.sample_to_function(code, self._template_program)
+        return thought, function
+
+    @classmethod
+    def trim_recipe_thought_from_response(cls, response: str) -> str | None:
+        try:
+            match = re.search(r'(?is)\bthought\s*:\s*(\{.*?\})', response)
+            return match.group(1) if match else None
+        except:
+            return None
+
     @classmethod
     def trim_thought_from_response(cls, response: str) -> str | None:
         try:

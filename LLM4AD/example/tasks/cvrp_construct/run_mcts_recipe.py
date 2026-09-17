@@ -21,7 +21,7 @@ def main():
     llm = build_llm(config)
     run_task(method_name='select_next_node',
              template_module='llm4ad.task.optimization.cvrp_construct.template',
-             evaluation=evaluation, llm=llm, **options)
+             evaluation=evaluation, llm=llm, task_type="cvrp", **options)
 
 
 if __name__ == '__main__':

@@ -87,6 +87,15 @@ class MCTSRecipe:
         self._tree_lock = threading.RLock()
         self._elite_pool = self._load_elite_pool() if self.use_elite_pool else []
         self._best_samples = self.store.load_best_samples()
+        self._convergence_records = self.store.load_convergence_records()
+        self._convergence_algorithm_ids = {
+            int(record["algorithm_id"])
+            for record in self._convergence_records
+            if isinstance(record, dict)
+            and record.get("algorithm_id") is not None
+        }
+        self._convergence_dirty = False
+        self._last_convergence_write_count = len(self._convergence_records)
         # Keep the append-only improvement history used by EoH.  The current
         # global best is the last/highest record, while every strict
         # improvement remains available for convergence analysis.
@@ -125,7 +134,7 @@ class MCTSRecipe:
                           token_usage=initial_token_usage)
         self.tree.root = root
         if not initial_samples_recorded:
-            self._record_best_candidates(population.individuals, root)
+            self._record_evaluated_candidates(population.individuals, root)
         self._update_elite_pool(population.individuals)
         self._write_node(root, population, None, [], initial_token_usage)
         # Persist the root once immediately. Subsequent nodes use batching.
@@ -251,7 +260,65 @@ class MCTSRecipe:
                 "population_node_id": int(population_node_id),
                 "depth": int(depth),
             })()
-            self._record_best_candidates([individual], context)
+            self._record_evaluated_candidates([individual], context)
+
+    def _record_evaluated_candidates(self, individuals, population_node):
+        """Persist global-best and best-so-far records for evaluated algorithms."""
+        with self._tree_lock:
+            any_appended = False
+            best_improved = False
+            for individual in individuals:
+                previous_best = self._best_score
+                self._record_best_candidates([individual], population_node)
+                best_improved = best_improved or self._best_score > previous_best
+                any_appended = self._append_convergence_record(
+                    individual, population_node) or any_appended
+            if not any_appended:
+                return
+            self._convergence_dirty = True
+            pending_records = (
+                len(self._convergence_records) - self._last_convergence_write_count)
+            if best_improved or pending_records >= max(1, self.store.batch_size):
+                self._write_convergence_outputs(plot=best_improved)
+
+    def _append_convergence_record(self, individual, population_node):
+        algorithm_id = getattr(individual, "_recipe_algorithm_id", None)
+        score = getattr(individual, "score", None)
+        if algorithm_id is None or score is None:
+            return False
+        try:
+            algorithm_id = int(algorithm_id)
+            score = float(score)
+        except (TypeError, ValueError):
+            return False
+        if algorithm_id in self._convergence_algorithm_ids:
+            return False
+        self._convergence_algorithm_ids.add(algorithm_id)
+        self._convergence_records.append({
+            "algorithm_id": algorithm_id,
+            "sample_order": getattr(individual, "_recipe_sample_order", None),
+            "population_node_id": population_node.population_node_id,
+            "depth": population_node.depth,
+            "recipe_id": getattr(individual, "_recipe_id", None),
+            "operator": getattr(individual, "operator", None),
+            "score": score,
+            "best_score_so_far": float(self._best_score),
+        })
+        return True
+
+    def _write_convergence_outputs(self, plot=False):
+        if not self._convergence_records:
+            return
+        if self._convergence_dirty:
+            self.store.write_convergence_records(self._convergence_records)
+            self._last_convergence_write_count = len(self._convergence_records)
+            self._convergence_dirty = False
+        if plot:
+            try:
+                self.store.write_convergence_plot(self._convergence_records)
+            except Exception as exc:
+                print(f"WARNING: failed to write convergence plot: {exc}",
+                      flush=True)
 
     def _record_best_candidates(self, individuals, population_node):
         """Append and persist each strict global-best improvement.
@@ -581,6 +648,7 @@ class MCTSRecipe:
             "cumulative_token_usage": dict(self._cumulative_token_usage),
         }
         self.store.write_checkpoint(path, state)
+        self._write_convergence_outputs(plot=True)
 
     @staticmethod
     def _encode_state(value):

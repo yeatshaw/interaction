@@ -23,11 +23,20 @@ def main():
     config = MCTS_RECIPE_CONFIG
     options = common_options("logs/mcts_recipe_tsp", config)
     eval_options = evaluation_config(config)
-    evaluation_mode = str(eval_options.pop("mode", "refineevo")).lower()
-    evaluation_cls = (
-        TSPEvaluation if evaluation_mode in {"original", "llm4ad"}
-        else RefineEVOTSPEvaluation
+    recipe_compatible_eoh = (
+        str(options.get("initialization_mode", "")).lower() in {"eoh", "original"}
+        and int(options.get("elite_pool_size", 0) or 0) == 0
     )
+    evaluation_mode = str(eval_options.pop("mode", "refineevo")).lower()
+    original_evaluation_modes = {"original", "llm4ad", "eoh"}
+    if recipe_compatible_eoh:
+        evaluation_cls = TSPEvaluation
+        eval_options["strict_recipe_dataset_format"] = True
+    else:
+        evaluation_cls = (
+            TSPEvaluation if evaluation_mode in original_evaluation_modes
+            else RefineEVOTSPEvaluation
+        )
     print(f"TSP evaluation mode: "
           f"{'refineevo' if evaluation_cls is RefineEVOTSPEvaluation else 'original'}",
           flush=True)
@@ -38,6 +47,7 @@ def main():
         template_module="llm4ad.task.optimization.tsp_construct.template",
         evaluation=evaluation,
         llm=llm,
+        task_type="tsp",
         **options,
     )
 

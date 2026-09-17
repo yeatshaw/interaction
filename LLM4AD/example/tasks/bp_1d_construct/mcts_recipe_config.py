@@ -45,4 +45,12 @@ MCTS_RECIPE_CONFIG = {
         "bin_capacity": 100,
         "dataset_path": "/public/home/liuyang/dataset/bp_1d/train/bp_1d_10k_C100_train.pkl",
     },
+    "test": {
+        "enabled": False,
+        "task": "",
+        "data_paths": [],
+        "output": "test_results.csv",
+        "max_nodes": 0,
+        "instance_timeout": 1800,
+    },
 }

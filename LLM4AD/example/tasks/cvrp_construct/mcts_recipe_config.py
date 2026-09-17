@@ -44,4 +44,14 @@ MCTS_RECIPE_CONFIG = {
         "capacity": 40,
         "dataset_path": None,
     },
+    "test": {
+        "enabled": True,
+        "task": "cvrp",
+        "data_paths": [
+            r"D:\A_Shaw\Academic\Files\program\interaction\LLM4AD\example\tasks\cvrp_construct\cvrp_instances_test_n200c50.pkl",
+        ],
+        "output": "cvrp_test_results.csv",
+        "max_nodes": 0,
+        "instance_timeout": 1800,
+    },
 }

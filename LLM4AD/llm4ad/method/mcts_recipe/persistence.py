@@ -154,6 +154,81 @@ class RecipeStore:
                 os.remove(tmp)
 
     @property
+    def convergence_path(self):
+        return os.path.join(self.directory, "overall_convergence.json")
+
+    @property
+    def convergence_plot_path(self):
+        return os.path.join(self.directory, "overall_convergence.png")
+
+    def load_convergence_records(self):
+        try:
+            with open(self.convergence_path, encoding="utf-8") as f:
+                payload = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
+        if isinstance(payload, dict):
+            records = payload.get("records", [])
+        elif isinstance(payload, list):
+            records = payload
+        else:
+            records = []
+        return records if isinstance(records, list) else []
+
+    def write_convergence_records(self, records):
+        payload = {
+            "x_axis": "algorithm_id",
+            "y_axis": "best_score_so_far",
+            "records": list(records),
+        }
+        fd, tmp = tempfile.mkstemp(prefix=".overall_convergence_",
+                                  dir=self.directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.convergence_path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    def write_convergence_plot(self, records):
+        points = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            algorithm_id = record.get("algorithm_id")
+            best_score = record.get("best_score_so_far", record.get("best_score"))
+            if algorithm_id is None or best_score is None:
+                continue
+            try:
+                points.append((int(algorithm_id), float(best_score)))
+            except (TypeError, ValueError):
+                continue
+        if not points:
+            return None
+        points.sort(key=lambda item: item[0])
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        x_values = [item[0] for item in points]
+        y_values = [item[1] for item in points]
+        fig, ax = plt.subplots(figsize=(9.5, 5.5))
+        ax.step(x_values, y_values, where="post", linewidth=1.8)
+        ax.scatter([x_values[-1]], [y_values[-1]], s=26, zorder=3)
+        ax.set_xlabel("Algorithm ID")
+        ax.set_ylabel("Best score so far")
+        ax.set_title("Global convergence")
+        ax.grid(True, alpha=0.28)
+        if len(x_values) == 1:
+            ax.set_xlim(x_values[0] - 1, x_values[0] + 1)
+        fig.tight_layout()
+        fig.savefig(self.convergence_plot_path, dpi=200)
+        plt.close(fig)
+        return self.convergence_plot_path
+
+    @property
     def elite_pool_path(self):
         return os.path.join(self.directory, "global_elite_pool.json")
 

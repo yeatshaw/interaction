@@ -18,7 +18,6 @@ import io
 import json
 import math
 import pickle
-import re
 import signal
 import traceback
 import zipfile
@@ -637,17 +636,18 @@ def run(args):
                                 "score": None if cost is None else -cost,
                                 "distance": cost, "gap": None})
     elif args.task == "cvrp":
-        cvrp_fields = ["instance", "gap"]
-        with output_path.open("w", newline="", encoding="utf-8-sig") as file:
-            csv.DictWriter(file, fieldnames=cvrp_fields).writeheader()
         print(f"Loading CVRP dataset: {args.data}", flush=True)
         d = load_cvrp_dict(Path(args.data))
         print(f"Loaded {len(d)} CVRP instances; output={output_path}", flush=True)
-        # Pickle lists have no original instance names and are represented by
-        # generated instance_XXXX keys. In that case mirror the TSP behavior:
-        # evaluate every instance, but write one file-level mean row.
-        aggregate = bool(d) and all(
-            re.fullmatch(r"instance_\d+", str(name)) for name in d)
+        has_optimal_values = any(
+            isinstance(item, (list, tuple)) and len(item) >= 5
+            and item[4] is not None
+            for item in d.values()
+        )
+        cvrp_fields = (["instance", "gap_percent"] if has_optimal_values
+                       else ["instance_count", "feasible_count", "mean_cost"])
+        with output_path.open("w", newline="", encoding="utf-8-sig") as file:
+            csv.DictWriter(file, fieldnames=cvrp_fields).writeheader()
         cvrp_rows = []
         for index, (name, item) in enumerate(d.items(), 1):
             # For CVRP, ``max_nodes`` is an exclusive upper bound so that
@@ -666,26 +666,34 @@ def run(args):
                     skipped_instances.append(str(name))
                     print(f"Skipped {name}: timeout after {instance_timeout}s", flush=True)
                     continue
-                row = {"instance": name,
-                       "gap": None if out is None else gap_percent(out[0], out[2])}
+                if has_optimal_values:
+                    row = {
+                        "instance": name,
+                        "gap_percent": (None if out is None
+                                        else gap_percent(out[0], out[2])),
+                    }
+                else:
+                    row = {"instance": name,
+                           "cost": None if out is None else out[0]}
             except Exception as exc:
                 print(f"CVRP instance {name!r} failed: {exc}", flush=True)
-                row = {"instance": name, "gap": None}
-            if aggregate:
-                cvrp_rows.append(row)
-            else:
+                row = ({"instance": name, "gap_percent": None}
+                       if has_optimal_values
+                       else {"instance": name, "cost": None})
+            if has_optimal_values:
                 rows.append(row)
                 with output_path.open("a", newline="", encoding="utf-8-sig") as file:
                     csv.DictWriter(file, fieldnames=cvrp_fields).writerow(row)
+            else:
+                cvrp_rows.append(row)
             print(f"Completed {index}/{len(d)}: {name}", flush=True)
-        if aggregate and cvrp_rows:
-            def mean_field(field):
-                values = [float(row[field]) for row in cvrp_rows
-                          if row[field] is not None]
-                return float(np.mean(values)) if values else None
+        if not has_optimal_values and cvrp_rows:
+            costs = [float(row["cost"]) for row in cvrp_rows
+                     if row["cost"] is not None]
             mean_row = {
-                "instance": "mean",
-                "gap": mean_field("gap"),
+                "instance_count": len(cvrp_rows),
+                "feasible_count": len(costs),
+                "mean_cost": float(np.mean(costs)) if costs else None,
             }
             rows.append(mean_row)
             with output_path.open("a", newline="", encoding="utf-8-sig") as file:
