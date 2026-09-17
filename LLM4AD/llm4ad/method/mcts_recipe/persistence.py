@@ -224,8 +224,16 @@ class RecipeStore:
         if len(x_values) == 1:
             ax.set_xlim(x_values[0] - 1, x_values[0] + 1)
         fig.tight_layout()
-        fig.savefig(self.convergence_plot_path, dpi=200)
-        plt.close(fig)
+        fd, tmp = tempfile.mkstemp(prefix=".overall_convergence_",
+                                  suffix=".png", dir=self.directory)
+        os.close(fd)
+        try:
+            fig.savefig(tmp, dpi=200)
+            os.replace(tmp, self.convergence_plot_path)
+        finally:
+            plt.close(fig)
+            if os.path.exists(tmp):
+                os.remove(tmp)
         return self.convergence_plot_path
 
     @property

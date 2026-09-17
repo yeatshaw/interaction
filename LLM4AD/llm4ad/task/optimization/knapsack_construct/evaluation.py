@@ -34,13 +34,26 @@
 
 from __future__ import annotations
 from typing import Callable, Any, List, Tuple
+import os
+import pickle
+from pathlib import Path
 import matplotlib.pyplot as plt
+import numpy as np
 
 from llm4ad.base import Evaluation
 from llm4ad.task.optimization.knapsack_construct.get_instance import GetData
 from llm4ad.task.optimization.knapsack_construct.template import task_description
 
 __all__ = ['KnapsackEvaluation']
+
+
+class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Load pickles written with NumPy 2.x from older NumPy environments."""
+
+    def find_class(self, module, name):
+        if module == "numpy._core" or module.startswith("numpy._core."):
+            module = "numpy.core" + module[len("numpy._core"):]
+        return super().find_class(module, name)
 
 
 class KnapsackEvaluation(Evaluation):
@@ -51,6 +64,7 @@ class KnapsackEvaluation(Evaluation):
                  n_instance=32,
                  n_items=50,
                  knapsack_capacity=100,
+                 dataset_path: str | Path | None = None,
                  **kwargs):
         """
         Initialize the evaluator for the Knapsack Problem.
@@ -58,11 +72,67 @@ class KnapsackEvaluation(Evaluation):
         super().__init__(use_numba_accelerate=False,
                          timeout_seconds=timeout_seconds)
 
+        self.dataset_path = dataset_path or os.environ.get("LLM4AD_KP_TRAIN_DATA")
         self.n_instance = n_instance
         self.n_items = n_items
         self.knapsack_capacity = knapsack_capacity
-        getData = GetData(self.n_instance, self.n_items, self.knapsack_capacity)
-        self._datasets = getData.generate_instances()
+        if self.dataset_path:
+            path = Path(self.dataset_path).expanduser()
+            if not path.is_file():
+                raise FileNotFoundError(f"Knapsack training dataset not found: {path}")
+            with path.open("rb") as file:
+                loaded = _NumpyCompatUnpickler(file).load()
+            self._datasets = self._normalize_datasets(loaded)
+            if not self._datasets:
+                raise ValueError(f"Knapsack training dataset is empty: {path}")
+            self.n_instance = len(self._datasets)
+            self.n_items = len(self._datasets[0][0])
+            self.knapsack_capacity = int(self._datasets[0][2])
+        else:
+            getData = GetData(self.n_instance, self.n_items, self.knapsack_capacity)
+            self._datasets = getData.generate_instances()
+
+    @staticmethod
+    def _normalize_datasets(loaded):
+        """Normalize pickle layouts to (item_weights, item_values, capacity)."""
+        if isinstance(loaded, np.ndarray) and loaded.shape == ():
+            loaded = loaded.item()
+        if isinstance(loaded, dict):
+            for key in ("instances", "data", "datasets", "knapsack", "kp"):
+                if key in loaded:
+                    loaded = loaded[key]
+                    break
+            else:
+                loaded = list(loaded.values())
+            if isinstance(loaded, dict):
+                loaded = list(loaded.values())
+        if isinstance(loaded, np.ndarray):
+            loaded = loaded.tolist()
+        if not isinstance(loaded, (list, tuple)):
+            raise ValueError("Knapsack dataset must be a list or dictionary of instances")
+
+        datasets = []
+        for index, instance in enumerate(loaded):
+            if isinstance(instance, dict):
+                weights = instance.get("weights", instance.get("item_weights"))
+                values = instance.get("values", instance.get("item_values"))
+                capacity = instance.get("capacity", instance.get("knapsack_capacity"))
+            elif isinstance(instance, (list, tuple)) and len(instance) >= 3:
+                weights, values, capacity = instance[:3]
+            else:
+                raise ValueError(f"Invalid knapsack instance at index {index}")
+
+            item_weights = [int(value) for value in np.asarray(weights).reshape(-1)]
+            item_values = [float(value) for value in np.asarray(values).reshape(-1)]
+            capacity = int(capacity)
+            if capacity <= 0:
+                raise ValueError(f"Invalid knapsack capacity at index {index}")
+            if not item_weights or len(item_weights) != len(item_values):
+                raise ValueError(f"Invalid knapsack item arrays at index {index}")
+            if any(weight <= 0 for weight in item_weights):
+                raise ValueError(f"Invalid knapsack weights at index {index}")
+            datasets.append((item_weights, item_values, capacity))
+        return datasets
 
     def evaluate_program(self, program_str: str, callable_func: Callable) -> Any | None:
         return self.evaluate(callable_func)

@@ -26,6 +26,7 @@ def main():
         template_module="llm4ad.task.optimization.knapsack_construct.template",
         evaluation=evaluation,
         llm=llm,
+        task_type="kp",
         **options,
     )
 

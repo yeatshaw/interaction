@@ -1,5 +1,10 @@
 """Editable Recipe-MCTS configuration for the 1D bin-packing task."""
 
+from pathlib import Path
+
+
+DATASET_DIR = Path(__file__).resolve().parent / "dataset"
+
 MCTS_RECIPE_CONFIG = {
     "log_dir": "logs/mcts_recipe_bp_1d",
     "checkpoint": None,
@@ -10,13 +15,13 @@ MCTS_RECIPE_CONFIG = {
         "selection_num": 2,
         "max_depth": 50,
         "max_sample_count": 10000,
-        "initialization_mode": "refineevo",
+        "initialization_mode": "eoh",
         "initial_sample_nums_max": None,
-        "init_pop_size": 30,
+        "init_pop_size": 20,
         "num_samplers": 10,
         "num_evaluators": 10,
-        "exploration_constant": 0.1,
-        "depth_balance_weight": 0.2,
+        "exploration_constant": 0.4,
+        "depth_balance_weight": 0.4,
         "node_batch_size": 10,
         "seed": None,
         "elite_pool_size": 0,
@@ -30,7 +35,7 @@ MCTS_RECIPE_CONFIG = {
         "timeout": 60,
     },
     "embedding": {
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "base_url": "https://api.apilio.ai/v1",
         "api_key": "",
         "api_key_env": ["LLM4AD_EMBEDDING_API_KEY", "OPENAI_API_KEY8", "LLM4AD_API_KEY"],
         "model": "text-embedding-v4",
@@ -43,13 +48,15 @@ MCTS_RECIPE_CONFIG = {
         "n_items": 500,
         "n_bins": 500,
         "bin_capacity": 100,
-        "dataset_path": "/public/home/liuyang/dataset/bp_1d/train/bp_1d_10k_C100_train.pkl",
+        "dataset_path": str(DATASET_DIR / "bp_1d_10k_C100_train.pkl"),
     },
     "test": {
-        "enabled": False,
-        "task": "",
-        "data_paths": [],
-        "output": "test_results.csv",
+        "enabled": True,
+        "task": "bp_1d",
+        "data_paths": [
+            str(DATASET_DIR),
+        ],
+        "output": "bp_1d_test_results",
         "max_nodes": 0,
         "instance_timeout": 1800,
     },

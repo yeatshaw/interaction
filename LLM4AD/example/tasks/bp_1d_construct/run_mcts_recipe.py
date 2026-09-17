@@ -26,6 +26,7 @@ def main():
         template_module="llm4ad.task.optimization.bp_1d_construct.template",
         evaluation=evaluation,
         llm=llm,
+        task_type="bp_1d",
         **options,
     )
 

@@ -266,20 +266,14 @@ class MCTSRecipe:
         """Persist global-best and best-so-far records for evaluated algorithms."""
         with self._tree_lock:
             any_appended = False
-            best_improved = False
             for individual in individuals:
-                previous_best = self._best_score
                 self._record_best_candidates([individual], population_node)
-                best_improved = best_improved or self._best_score > previous_best
                 any_appended = self._append_convergence_record(
                     individual, population_node) or any_appended
             if not any_appended:
                 return
             self._convergence_dirty = True
-            pending_records = (
-                len(self._convergence_records) - self._last_convergence_write_count)
-            if best_improved or pending_records >= max(1, self.store.batch_size):
-                self._write_convergence_outputs(plot=best_improved)
+            self._write_convergence_outputs(plot=False)
 
     def _append_convergence_record(self, individual, population_node):
         algorithm_id = getattr(individual, "_recipe_algorithm_id", None)
@@ -534,6 +528,7 @@ class MCTSRecipe:
         self.store.flush()
         self._checkpoint_index += 1
         self._write_checkpoint()
+        self._write_convergence_outputs(plot=True)
         return self.tree.root
 
     def restore(self, checkpoint):
@@ -648,7 +643,6 @@ class MCTSRecipe:
             "cumulative_token_usage": dict(self._cumulative_token_usage),
         }
         self.store.write_checkpoint(path, state)
-        self._write_convergence_outputs(plot=True)
 
     @staticmethod
     def _encode_state(value):

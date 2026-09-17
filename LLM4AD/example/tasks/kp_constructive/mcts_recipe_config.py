@@ -1,5 +1,10 @@
 """Editable Recipe-MCTS configuration for the knapsack task."""
 
+from pathlib import Path
+
+
+DATASET_DIR = Path(__file__).resolve().parent / "dataset"
+
 MCTS_RECIPE_CONFIG = {
     "log_dir": "logs/mcts_recipe_kp",
     "checkpoint": None,
@@ -42,12 +47,13 @@ MCTS_RECIPE_CONFIG = {
         "n_instance": 50,
         "n_items": 100,
         "knapsack_capacity": 100,
+        "dataset_path": str(DATASET_DIR / "kp_n100_train.pkl"),
     },
     "test": {
-        "enabled": False,
-        "task": "",
-        "data_paths": [],
-        "output": "test_results.csv",
+        "enabled": True,
+        "task": "kp",
+        "data_paths": [str(DATASET_DIR)],
+        "output": "kp_test_results",
         "max_nodes": 0,
         "instance_timeout": 1800,
     },

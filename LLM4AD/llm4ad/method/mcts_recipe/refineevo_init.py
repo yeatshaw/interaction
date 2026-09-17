@@ -142,21 +142,21 @@ def select_next_node(current_node: int, depot: int, unvisited_nodes: np.ndarray,
     },
     "kp_constructive": {
         "problem_desc": "Solving the 0/1 Knapsack Problem with constructive heuristics. The goal is to select a subset of items maximizing total value without exceeding the knapsack capacity.",
-        "func_desc": "The select_next_item function takes as input the remaining capacity, a numpy array of item values, and a numpy array of item weights, and returns the next item to pick.",
+        "func_desc": "The select_next_item function takes as input the remaining knapsack capacity and a list of candidate tuples (weight, value, original_index), and returns one selected tuple or None if no item fits.",
         "seed_func": """import numpy as np
 
-def select_next_item(remaining_capacity, weights, values):
-    \"\"\"
-    Greedy constructive
-    \"\"\"
-    feasible_mask = weights <= remaining_capacity
-    ratios = values / weights
-
-    feasible_indices = np.where(feasible_mask)[0]
-    best_local_idx = np.argmax(ratios[feasible_mask])
-    best_index = feasible_indices[best_local_idx]
-
-    return best_index
+def select_next_item(remaining_capacity, remaining_items):
+    \"\"\"Greedy value-to-weight constructive heuristic.\"\"\"
+    best_item = None
+    best_ratio = -1.0
+    for item in remaining_items:
+        weight, value, index = item
+        if weight <= remaining_capacity:
+            ratio = value / weight
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_item = item
+    return best_item
 """,
         "external_knowledge": "",
     },

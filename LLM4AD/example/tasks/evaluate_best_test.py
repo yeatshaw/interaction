@@ -9,6 +9,8 @@ Examples:
       --data dataset/cvrplib/data/cvrp_test_lt200.npz --output cvrp_test.csv
   python example/tasks/evaluate_best_test.py --task vrptw --logs logs/mcts_recipe_vrptw \
       --data dataset/vrptw_test/solomon --output vrptw_test.csv
+  python example/tasks/evaluate_best_test.py --task kp --logs logs/mcts_recipe_kp \
+      --data example/tasks/kp_constructive/dataset --output kp_test_results
 """
 from __future__ import annotations
 
@@ -55,7 +57,7 @@ def evaluate_best_experiment(task_type, experiment_dir, test_sets,
     """Evaluate the final best algorithm on one or more independent test sets.
 
     Args:
-        task_type: One of ``tsp``, ``cvrp`` or ``vrptw``.
+        task_type: One of ``tsp``, ``cvrp``, ``vrptw``, ``bp_1d`` or ``kp``.
         experiment_dir: Directory containing ``sample_best.json`` (or the JSON
             file itself). The final list item is treated as the global best.
         test_sets: One path or an iterable of paths. Each path produces its own
@@ -70,11 +72,31 @@ def evaluate_best_experiment(task_type, experiment_dir, test_sets,
         List of generated CSV paths.
     """
     task_type = str(task_type).lower()
-    if task_type not in {"tsp", "cvrp", "vrptw"}:
+    if task_type in {"bp", "bp1d", "bp_1d_construct"}:
+        task_type = "bp_1d"
+    if task_type in {"knapsack", "knapsack_construct", "kp_construct", "kp_constructive"}:
+        task_type = "kp"
+    if task_type not in {"tsp", "cvrp", "vrptw", "bp_1d", "kp"}:
         raise ValueError(f"Unsupported task type: {task_type}")
     if isinstance(test_sets, (str, Path)):
         test_sets = [test_sets]
     test_sets = [Path(path) for path in test_sets]
+    if task_type == "bp_1d":
+        expanded = []
+        for path in test_sets:
+            if path.is_dir():
+                expanded.extend(sorted(path.glob("*test.pkl")))
+            else:
+                expanded.append(path)
+        test_sets = expanded
+    if task_type == "kp":
+        expanded = []
+        for path in test_sets:
+            if path.is_dir():
+                expanded.extend(sorted(path.glob("*test.pkl")))
+            else:
+                expanded.append(path)
+        test_sets = expanded
     if not test_sets:
         raise ValueError("At least one test set is required")
 
@@ -470,6 +492,181 @@ def eval_cvrp(fn, item):
     return cost, int(sum(x == 0 for x in route[1:-1])), float(bks) if bks is not None else None
 
 
+def load_kp_instances(path: Path) -> list[tuple[str, list[int], list[float], int, float | None]]:
+    with path.open("rb") as file:
+        payload = _NumpyCompatUnpickler(file).load()
+    if isinstance(payload, np.ndarray) and payload.shape == ():
+        payload = payload.item()
+    if isinstance(payload, dict):
+        for key in ("instances", "data", "datasets", "knapsack", "kp"):
+            if key in payload:
+                payload = payload[key]
+                break
+        else:
+            payload = list(payload.items())
+        if isinstance(payload, dict):
+            payload = list(payload.items())
+    if isinstance(payload, np.ndarray):
+        payload = payload.tolist()
+    if not isinstance(payload, (list, tuple)):
+        raise ValueError(f"KP dataset must be a list or dictionary: {path}")
+
+    instances = []
+    for index, item in enumerate(payload, 1):
+        name = f"instance_{index:03d}"
+        optimal_value = None
+        if isinstance(item, dict):
+            name = item.get("instance", item.get("name", name))
+            weights = item.get("weights", item.get("item_weights"))
+            values = item.get("values", item.get("item_values"))
+            capacity = item.get("capacity", item.get("knapsack_capacity"))
+            optimal_value = item.get("optimal_value", item.get("optimum"))
+        elif (isinstance(item, (list, tuple)) and len(item) == 2
+              and isinstance(item[0], str)):
+            name = item[0]
+            item = item[1]
+            if isinstance(item, dict):
+                weights = item.get("weights", item.get("item_weights"))
+                values = item.get("values", item.get("item_values"))
+                capacity = item.get("capacity", item.get("knapsack_capacity"))
+                optimal_value = item.get("optimal_value", item.get("optimum"))
+            elif isinstance(item, (list, tuple)) and len(item) >= 3:
+                weights, values, capacity = item[:3]
+                optimal_value = item[3] if len(item) >= 4 else None
+            else:
+                raise ValueError(f"Invalid KP instance {name!r}")
+        elif isinstance(item, (list, tuple)) and len(item) >= 3:
+            weights, values, capacity = item[:3]
+            optimal_value = item[3] if len(item) >= 4 else None
+        else:
+            raise ValueError(f"Invalid KP instance at index {index}")
+
+        item_weights = [int(value) for value in np.asarray(weights).reshape(-1)]
+        item_values = [float(value) for value in np.asarray(values).reshape(-1)]
+        capacity = int(capacity)
+        if capacity <= 0:
+            raise ValueError(f"Invalid KP capacity for {name}")
+        if not item_weights or len(item_weights) != len(item_values):
+            raise ValueError(f"Invalid KP item arrays for {name}")
+        if any(weight <= 0 for weight in item_weights):
+            raise ValueError(f"Invalid KP weights for {name}")
+        instances.append((str(name), item_weights, item_values, capacity,
+                          None if optimal_value is None else float(optimal_value)))
+    return instances
+
+
+def kp_exact_optimum(weights, values, capacity):
+    dp = [0.0] * (int(capacity) + 1)
+    for weight, value in zip(weights, values):
+        weight = int(weight)
+        if weight > capacity:
+            continue
+        for cap in range(int(capacity), weight - 1, -1):
+            candidate = dp[cap - weight] + float(value)
+            if candidate > dp[cap]:
+                dp[cap] = candidate
+    return float(dp[int(capacity)])
+
+
+def maximize_gap_percent(value, optimum):
+    if value is None or optimum is None:
+        return None
+    try:
+        optimum = float(optimum)
+        return None if not math.isfinite(optimum) or optimum == 0 else (optimum - float(value)) / optimum * 100.0
+    except (TypeError, ValueError):
+        return None
+
+
+def eval_kp(fn, weights, values, capacity):
+    remaining_items = list(zip(weights, values, range(len(weights))))
+    remaining_capacity = int(capacity)
+    total_value = 0.0
+    while remaining_items and remaining_capacity > 0:
+        selected_item = fn(remaining_capacity, remaining_items)
+        if selected_item is None:
+            break
+        try:
+            weight, value, index = selected_item
+        except (TypeError, ValueError):
+            return None
+        if selected_item not in remaining_items:
+            return None
+        if weight <= remaining_capacity:
+            total_value += float(value)
+            remaining_capacity -= int(weight)
+        remaining_items.remove(selected_item)
+    return total_value
+
+
+def load_bp1d_instances(path: Path) -> list[tuple[str, list[int], int, int]]:
+    with path.open("rb") as file:
+        payload = _NumpyCompatUnpickler(file).load()
+    if isinstance(payload, np.ndarray):
+        payload = payload.tolist()
+    if isinstance(payload, dict):
+        for key in ("instances", "data", "datasets", "bp_1d"):
+            if key in payload:
+                payload = payload[key]
+                break
+        else:
+            payload = list(payload.values())
+    if not isinstance(payload, (list, tuple)):
+        raise ValueError(f"BP_1D dataset must be a list or dictionary: {path}")
+
+    instances = []
+    for index, item in enumerate(payload, 1):
+        if isinstance(item, dict):
+            name = item.get("instance", item.get("name", f"instance_{index:03d}"))
+            items = item.get("items", item.get("item_weights"))
+            capacity = item.get("capacity", item.get("bin_capacity"))
+            lower_bound = item.get("theoretical_lower_bound")
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            name = f"instance_{index:03d}"
+            items, capacity = item[:2]
+            lower_bound = item[2] if len(item) >= 3 else None
+        else:
+            raise ValueError(f"Invalid BP_1D instance at index {index}")
+        weights = [int(value) for value in np.asarray(items).reshape(-1)]
+        capacity = int(capacity)
+        if lower_bound is None:
+            lower_bound = int(math.ceil(sum(weights) / capacity))
+        if capacity <= 0 or not weights or any(
+                weight <= 0 or weight > capacity for weight in weights):
+            raise ValueError(f"Invalid BP_1D weights/capacity for {name}")
+        instances.append((str(name), weights, capacity, int(lower_bound)))
+    return instances
+
+
+def eval_bp1d(fn, items, capacity):
+    n_bins = len(items)
+    bins = [[] for _ in range(n_bins)]
+    remaining_items = list(items)
+    remaining_capacities = [int(capacity)] * n_bins
+
+    while remaining_items:
+        try:
+            selected_item, selected_bin = fn(
+                list(remaining_items), list(remaining_capacities))
+        except (TypeError, ValueError):
+            return None
+        if selected_bin is None or selected_item not in remaining_items:
+            return None
+        if not isinstance(selected_bin, (int, np.integer)):
+            return None
+        selected_bin = int(selected_bin)
+        selected_item = int(selected_item)
+        if selected_bin < 0 or selected_bin >= n_bins:
+            return None
+        if selected_item > remaining_capacities[selected_bin]:
+            return None
+        bins[selected_bin].append(selected_item)
+        remaining_capacities[selected_bin] -= selected_item
+        remaining_items.remove(selected_item)
+
+    return sum(1 for bin_content in bins if bin_content)
+
+
 def parse_solomon(path: Path):
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     cap = None; rows = []; in_customer = False; expect_capacity = False
@@ -702,6 +899,121 @@ def run(args):
         if skipped_instances:
             print("skipped_instances=" + ",".join(skipped_instances), flush=True)
         return
+    elif args.task == "kp":
+        kp_fields = ["dataset", "instance_count", "feasible_count",
+                     "item_count", "knapsack_capacity", "mean_value",
+                     "mean_score", "mean_optimal_value",
+                     "mean_gap_to_optimal_percent"]
+        with output_path.open("w", newline="", encoding="utf-8-sig") as file:
+            csv.DictWriter(file, fieldnames=kp_fields).writeheader()
+        data_path = Path(args.data)
+        print(f"Loading KP dataset: {data_path}", flush=True)
+        instances = load_kp_instances(data_path)
+        print(f"Loaded {len(instances)} KP instances; output={output_path}", flush=True)
+        evaluated = []
+        for index, (name, weights, values, capacity, optimal_value) in enumerate(instances, 1):
+            try:
+                value, timed_out = call_with_timeout(
+                    lambda: eval_kp(fn, weights, values, capacity), instance_timeout)
+                if timed_out:
+                    skipped_instances.append(str(name))
+                    print(f"Skipped {name}: timeout after {instance_timeout}s", flush=True)
+                    continue
+            except Exception as exc:
+                print(f"KP instance {name!r} failed: {exc}", flush=True)
+                value = None
+            if optimal_value is None:
+                optimal_value = kp_exact_optimum(weights, values, capacity)
+            evaluated.append({
+                "value": value,
+                "optimal_value": optimal_value,
+                "item_count": len(weights),
+                "capacity": capacity,
+            })
+            print(f"Completed {index}/{len(instances)}: {name}", flush=True)
+        feasible = [row for row in evaluated if row["value"] is not None]
+        gaps = [maximize_gap_percent(row["value"], row["optimal_value"])
+                for row in feasible]
+        gaps = [gap for gap in gaps if gap is not None]
+        summary = {
+            "dataset": data_path.stem,
+            "instance_count": len(evaluated),
+            "feasible_count": len(feasible),
+            "item_count": (float(np.mean([row["item_count"] for row in evaluated]))
+                           if evaluated else None),
+            "knapsack_capacity": (float(np.mean([row["capacity"] for row in evaluated]))
+                                  if evaluated else None),
+            "mean_value": (float(np.mean([row["value"] for row in feasible]))
+                           if feasible else None),
+            "mean_score": (float(np.mean([row["value"] for row in feasible]))
+                           if feasible else None),
+            "mean_optimal_value": (float(np.mean([row["optimal_value"] for row in evaluated]))
+                                   if evaluated else None),
+            "mean_gap_to_optimal_percent": float(np.mean(gaps)) if gaps else None,
+        }
+        rows.append(summary)
+        with output_path.open("a", newline="", encoding="utf-8-sig") as file:
+            csv.DictWriter(file, fieldnames=kp_fields).writerow(summary)
+        print(f"completed={len(rows)} output={output_path}", flush=True)
+        if skipped_instances:
+            print("skipped_instances=" + ",".join(skipped_instances), flush=True)
+        return
+    elif args.task == "bp_1d":
+        bp_fields = ["dataset", "instance_count", "feasible_count",
+                     "item_count", "bin_capacity", "mean_bins", "mean_score",
+                     "mean_lower_bound", "mean_gap_to_lower_bound_percent"]
+        with output_path.open("w", newline="", encoding="utf-8-sig") as file:
+            csv.DictWriter(file, fieldnames=bp_fields).writeheader()
+        data_path = Path(args.data)
+        print(f"Loading BP_1D dataset: {data_path}", flush=True)
+        instances = load_bp1d_instances(data_path)
+        print(f"Loaded {len(instances)} BP_1D instances; output={output_path}", flush=True)
+        evaluated = []
+        for index, (name, items, capacity, lower_bound) in enumerate(instances, 1):
+            try:
+                used_bins, timed_out = call_with_timeout(
+                    lambda: eval_bp1d(fn, items, capacity), instance_timeout)
+                if timed_out:
+                    skipped_instances.append(str(name))
+                    print(f"Skipped {name}: timeout after {instance_timeout}s", flush=True)
+                    continue
+            except Exception as exc:
+                print(f"BP_1D instance {name!r} failed: {exc}", flush=True)
+                used_bins = None
+            evaluated.append({
+                "used_bins": used_bins,
+                "lower_bound": lower_bound,
+                "item_count": len(items),
+                "capacity": capacity,
+            })
+            print(f"Completed {index}/{len(instances)}: {name}", flush=True)
+        feasible = [row for row in evaluated if row["used_bins"] is not None]
+        gaps = [gap_percent(row["used_bins"], row["lower_bound"])
+                for row in feasible]
+        gaps = [gap for gap in gaps if gap is not None]
+        summary = {
+            "dataset": data_path.stem,
+            "instance_count": len(evaluated),
+            "feasible_count": len(feasible),
+            "item_count": (float(np.mean([row["item_count"] for row in evaluated]))
+                           if evaluated else None),
+            "bin_capacity": (float(np.mean([row["capacity"] for row in evaluated]))
+                             if evaluated else None),
+            "mean_bins": (float(np.mean([row["used_bins"] for row in feasible]))
+                          if feasible else None),
+            "mean_score": (-float(np.mean([row["used_bins"] for row in feasible]))
+                           if feasible else None),
+            "mean_lower_bound": (float(np.mean([row["lower_bound"] for row in feasible]))
+                                 if feasible else None),
+            "mean_gap_to_lower_bound_percent": float(np.mean(gaps)) if gaps else None,
+        }
+        rows.append(summary)
+        with output_path.open("a", newline="", encoding="utf-8-sig") as file:
+            csv.DictWriter(file, fieldnames=bp_fields).writerow(summary)
+        print(f"completed={len(rows)} output={output_path}", flush=True)
+        if skipped_instances:
+            print("skipped_instances=" + ",".join(skipped_instances), flush=True)
+        return
     else:
         vrptw_fields = ["instance", "vehicles", "distance"]
         # Write the header before parsing any input and append each Solomon
@@ -741,7 +1053,7 @@ def run(args):
 
 
 if __name__ == "__main__":
-    p=argparse.ArgumentParser(); p.add_argument("--task",choices=("tsp","cvrp","vrptw"),required=True); p.add_argument("--logs",required=True); p.add_argument("--data",nargs="+",required=True); p.add_argument("--output",help="CSV path for one test set, or output directory for multiple sets"); p.add_argument("--max-nodes",type=int,default=0,help="TSP maximum node count, inclusive; 0 means no limit"); p.add_argument("--instance-timeout",type=int,default=1800,help="Per-instance timeout in seconds for TSP/CVRP; 0 disables it");
+    p=argparse.ArgumentParser(); p.add_argument("--task",choices=("tsp","cvrp","vrptw","bp_1d","kp"),required=True); p.add_argument("--logs",required=True); p.add_argument("--data",nargs="+",required=True); p.add_argument("--output",help="CSV path for one test set, or output directory for multiple sets"); p.add_argument("--max-nodes",type=int,default=0,help="TSP maximum node count, inclusive; 0 means no limit"); p.add_argument("--instance-timeout",type=int,default=1800,help="Per-instance timeout in seconds for TSP/CVRP/BP_1D/KP; 0 disables it");
     try:
         args = p.parse_args()
         evaluate_best_experiment(
