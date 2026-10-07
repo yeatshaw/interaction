@@ -5,12 +5,14 @@ import json
 import os
 import base64
 import concurrent.futures
+import math
 import pickle
 import random
 import threading
 from dataclasses import dataclass
 
 from .budget import SampleBudgetExhausted
+from .adaptive_router import ContextualThompsonRouter
 from .mcts import RecipeMCTS, RecipeNode
 from .population import RecipePopulation
 from .persistence import RecipeStore
@@ -47,9 +49,9 @@ class MCTSRecipe:
     def __init__(self, recipes, pop_size=10, selection_num=2,
                  max_depth=50, exploration_constant=0.1,
                  depth_balance_weight=0.0,
-                 node_batch_size=10, store_dir="recipe_mcts",
+                 node_batch_size=100, store_dir="recipe_mcts",
                  expand_fn=None, seed=None, max_sample_count=None,
-                 elite_pool_size=0):
+                 elite_pool_size=0, adaptive_config=None):
         recipes = validate_recipes(recipes)
         self.recipes = {
             k: (v if isinstance(v, RecipeConfig) else RecipeConfig(k, dict(v)))
@@ -63,6 +65,26 @@ class MCTSRecipe:
         if self.elite_pool_size < 0:
             raise ValueError("elite_pool_size must be >= 0")
         self.use_elite_pool = self.elite_pool_size > 0
+        self.adaptive_config = dict(adaptive_config or {})
+        self.adaptive_enabled = bool(
+            self.adaptive_config.get("enabled", False))
+        self.adaptive_recipe_count = int(
+            self.adaptive_config.get("recipes_per_expansion", 3))
+        if self.adaptive_recipe_count < 1:
+            raise ValueError("recipes_per_expansion must be >= 1")
+        self.adaptive_reward_best_weight = float(
+            self.adaptive_config.get("reward_best_weight", 0.8))
+        self.adaptive_reward_mean_weight = float(
+            self.adaptive_config.get("reward_mean_weight", 0.2))
+        self.adaptive_router = None
+        if self.adaptive_enabled:
+            self.adaptive_router = ContextualThompsonRouter(
+                self.recipes.keys(),
+                prior_precision=float(
+                    self.adaptive_config.get("prior_precision", 1.0)),
+                posterior_scale=float(
+                    self.adaptive_config.get("posterior_scale", 0.5)),
+            )
         # UNCERTAIN: the exact recipe definitions and EoH integration callback
         # are deliberately supplied by the task runner, not hard-coded here.
         self.depth_balance_weight = float(depth_balance_weight)
@@ -70,6 +92,16 @@ class MCTSRecipe:
             self.recipes, exploration_constant, max_depth,
             depth_balance_weight=self.depth_balance_weight)
         self.store = RecipeStore(store_dir, node_batch_size)
+        # All recipe-MCTS variants share the disk-backed tree index. The
+        # selected node's population snapshot is loaded only when expanded.
+        self._disk_tree_mode = True
+        self._tree_checkpoint_pending = False
+        # Compact, non-algorithm tree metadata generated after the last node
+        # snapshot flush. It is committed only after the corresponding node
+        # records are durable, preventing a checkpoint from pointing at a
+        # node that still exists only in RecipeStore.buffer.
+        self._tree_root_id = None
+        self._pending_tree_updates = {}
         if max_sample_count is not None:
             max_sample_count = int(max_sample_count)
             if max_sample_count < 1:
@@ -127,20 +159,44 @@ class MCTSRecipe:
         if not population.individuals:
             raise ValueError("initial population cannot be empty")
         self._assign_algorithm_ids(population.individuals)
-        best = max(x.score for x in population.individuals)
+        best, mean, std = self._population_stats(population)
         root_id = self._next_population_node_id
         self._next_population_node_id += 1
-        root = RecipeNode(root_id, best, depth=0,
-                          token_usage=initial_token_usage)
+        root = RecipeNode(
+            root_id,
+            best,
+            depth=0,
+            token_usage=initial_token_usage,
+            stagnation_iteration=0,
+            best_score=best,
+            score_mean=mean,
+            score_std=std,
+        )
         self.tree.root = root
         if not initial_samples_recorded:
             self._record_evaluated_candidates(population.individuals, root)
         self._update_elite_pool(population.individuals)
         self._write_node(root, population, None, [], initial_token_usage)
-        # Persist the root once immediately. Subsequent nodes use batching.
-        if self.store.flush() is not None:
-            self._checkpoint_index += 1
-            self._write_checkpoint()
+        self.store.flush()
+        self._set_pending_tree_state(root_id, [{
+            "population_node_id": root_id,
+            "parent_population_node_id": None,
+            "depth": 0,
+            "Q": float(root.Q),
+            "visits": int(root.visits),
+            "children_population_node_ids": [],
+            "expanded_recipe_ids": [],
+            "incoming_recipe_id": None,
+            "token_usage": dict(initial_token_usage or {}),
+            "stagnation_iteration": 0,
+            "best_score": best,
+            "score_mean": mean,
+            "score_std": std,
+        }])
+        self._commit_pending_tree_state()
+        self._checkpoint_index += 1
+        self._write_checkpoint()
+        self.tree.root = None
         return root
 
     def _assign_algorithm_ids(self, individuals):
@@ -363,8 +419,11 @@ class MCTSRecipe:
             node.depth, recipe_id, population.generation, population,
             experiences, token_usage=token_usage)
         if flushed is not None:
-            self._checkpoint_index += 1
-            self._write_checkpoint()
+            if self._disk_tree_mode:
+                self._tree_checkpoint_pending = True
+            else:
+                self._checkpoint_index += 1
+                self._write_checkpoint()
 
     def _accumulate_token_usage(self, usage):
         """Add one node/initialization aggregate to the checkpoint total."""
@@ -388,8 +447,38 @@ class MCTSRecipe:
                                       record.get("generation", 0))
         return population, list(record.get("experiences", []))
 
+    @staticmethod
+    def _population_stats(population):
+        scores = np.asarray([
+            float(item.score) for item in population.individuals
+            if getattr(item, "score", None) is not None
+        ], dtype=float)
+        if scores.size == 0:
+            raise ValueError("population has no scored individuals")
+        return float(np.max(scores)), float(np.mean(scores)), float(np.std(scores))
+
+    def _adaptive_state(self, node, population):
+        best, mean, std = self._population_stats(population)
+        return [
+            float(node.depth),
+            float(getattr(node, "stagnation_iteration", 0)),
+            best,
+            mean,
+            std,
+        ]
+
+    def _adaptive_reward(self, parent_population, child_population):
+        parent_best, parent_mean, _ = self._population_stats(parent_population)
+        child_best, child_mean, _ = self._population_stats(child_population)
+        best_gain = child_best - parent_best
+        mean_gain = child_mean - parent_mean
+        return (
+            self.adaptive_reward_best_weight * best_gain
+            + self.adaptive_reward_mean_weight * mean_gain
+        )
+
     def expand_node(self, node, population, experiences=None):
-        """Expand every recipe exactly once from the same parent snapshot."""
+        """Expand pending recipes from one shared parent snapshot."""
         if self.expand_fn is None:
             raise NotImplementedError(
                 "Provide expand_fn implementing EoH reflection + operator scheduling.")
@@ -405,6 +494,29 @@ class MCTSRecipe:
         if not pending_recipes:
             raise RuntimeError(
                 f"Population node {node.population_node_id} is already fully expanded")
+        adaptive_state = None
+        sampled_recipe_values = {}
+        if self.adaptive_enabled:
+            adaptive_state = self._adaptive_state(node, population)
+            selected_ids, sampled_recipe_values = (
+                self.adaptive_router.select_top_k(
+                    adaptive_state,
+                    [recipe_id for recipe_id, _ in pending_recipes],
+                    k=self.adaptive_recipe_count,
+                )
+            )
+            selected_set = set(selected_ids)
+            pending_recipes = [
+                (recipe_id, recipe)
+                for recipe_id, recipe in pending_recipes
+                if recipe_id in selected_set
+            ]
+            print(
+                f"Adaptive recipe selection node={node.population_node_id} "
+                f"state={adaptive_state} selected="
+                f"{[recipe_id for recipe_id, _ in pending_recipes]}",
+                flush=True,
+            )
         children = []
 
         with self._tree_lock:
@@ -463,18 +575,34 @@ class MCTSRecipe:
                 else:
                     child_population = branch_population.inherited_next_generation()
                 child_id = child_ids[recipe_id]
+                child_best, child_mean, child_std = self._population_stats(
+                    child_population)
+                stagnation_iteration = (
+                    0 if child_best > node.best_score
+                    else node.stagnation_iteration + 1
+                )
                 child = RecipeNode(
                     child_id,
-                    max(x.score for x in child_population.individuals),
+                    child_best,
                     depth=node.depth + 1, parent=node,
                     incoming_recipe_id=recipe_id,
-                    token_usage=node_token_usage)
+                    token_usage=node_token_usage,
+                    stagnation_iteration=stagnation_iteration,
+                    best_score=child_best,
+                    score_mean=child_mean,
+                    score_std=child_std,
+                )
                 node.add_child(child)
                 # One completed recipe edge is one visit to its new child and
                 # one additional visit propagated through every ancestor.
                 self.tree.backpropagate(child)
                 branch_experiences.extend(new_experiences)
                 self._update_elite_pool(child_population.individuals)
+                if self.adaptive_enabled:
+                    reward = self._adaptive_reward(
+                        population, child_population)
+                    self.adaptive_router.update(
+                        recipe_id, adaptive_state, reward)
                 self._write_node(child, child_population, recipe_id,
                                  branch_experiences, node_token_usage)
                 elite_text = (f" elite_pool={len(self._elite_pool)}/"
@@ -503,7 +631,7 @@ class MCTSRecipe:
         else:
             if initial_individuals is None:
                 raise ValueError("initial_individuals is required for a new run")
-            if self.store.next_file_start > 1:
+            if self.store.has_population_nodes():
                 raise FileExistsError(
                     f"{self.store.directory} already contains population nodes; "
                     "use a new LLM4AD_LOG_DIR or set LLM4AD_CHECKPOINT")
@@ -514,11 +642,32 @@ class MCTSRecipe:
                 with self._tree_lock:
                     self._log_sample_limit_once_locked()
                 break
-            node = self.tree.select()
+            node = (self._select_disk_tree_node()
+                    if self._disk_tree_mode else self.tree.select())
+            if node is None:
+                break
             if node.depth >= self.max_depth:
                 break
             population, experiences = self._load_node_state(node.population_node_id)
             children = self.expand_node(node, population, experiences)
+            if self._disk_tree_mode:
+                self._write_disk_tree_transition(node, children)
+                if self._tree_checkpoint_pending:
+                    self.store.flush()
+                    self._commit_pending_tree_state()
+                    self._checkpoint_index += 1
+                    self._write_checkpoint()
+                    self._tree_checkpoint_pending = False
+                has_children = bool(children)
+                del children, population, node
+                self.tree.root = None
+                if self.sample_budget_exhausted():
+                    with self._tree_lock:
+                        self._log_sample_limit_once_locked()
+                    break
+                if not has_children:
+                    break
+                continue
             if self.sample_budget_exhausted():
                 with self._tree_lock:
                     self._log_sample_limit_once_locked()
@@ -526,10 +675,226 @@ class MCTSRecipe:
             if not children or any(child.depth >= self.max_depth for child in children):
                 break
         self.store.flush()
+        self._commit_pending_tree_state()
         self._checkpoint_index += 1
         self._write_checkpoint()
         self._write_convergence_outputs(plot=True)
         return self.tree.root
+
+    def _disk_tree_records(self):
+        payload = self._disk_tree_payload()
+        records = {}
+        for item in payload.get("nodes", []):
+            try:
+                records[int(item["population_node_id"])] = dict(item)
+            except (KeyError, TypeError, ValueError):
+                continue
+        return payload.get("root_id"), records
+
+    def _disk_tree_payload(self):
+        payload = self.store.load_tree_state()
+        root_id = (self._tree_root_id
+                   if self._tree_root_id is not None
+                   else payload.get("root_id"))
+        by_id = {}
+        for item in payload.get("nodes", []):
+            try:
+                by_id[int(item["population_node_id"])] = dict(item)
+            except (KeyError, TypeError, ValueError):
+                continue
+        for node_id, item in self._pending_tree_updates.items():
+            by_id[int(node_id)] = dict(item)
+        return {"root_id": root_id, "nodes": list(by_id.values())}
+
+    def _set_pending_tree_state(self, root_id, records, changed_ids=None):
+        self._tree_root_id = int(root_id) if root_id is not None else None
+        if isinstance(records, dict):
+            for node_id in changed_ids or ():
+                if node_id in records:
+                    self._pending_tree_updates[int(node_id)] = dict(
+                        records[node_id])
+        else:
+            for item in records:
+                if item.get("population_node_id") is not None:
+                    self._pending_tree_updates[
+                        int(item["population_node_id"])] = dict(item)
+
+    def _commit_pending_tree_state(self):
+        if not self._pending_tree_updates:
+            return
+        payload = self.store.load_tree_state()
+        by_id = {}
+        for item in payload.get("nodes", []):
+            try:
+                by_id[int(item["population_node_id"])] = dict(item)
+            except (KeyError, TypeError, ValueError):
+                continue
+        for node_id, item in self._pending_tree_updates.items():
+            by_id[int(node_id)] = dict(item)
+        self.store.write_tree_state(
+            self._tree_root_id if self._tree_root_id is not None
+            else payload.get("root_id"),
+            list(by_id.values()),
+        )
+        self._pending_tree_updates = {}
+
+    def _select_disk_tree_node(self):
+        """Select one node using metadata loaded from disk for this call only."""
+        root_id, records = self._disk_tree_records()
+        if root_id is None or root_id not in records:
+            raise KeyError("disk-backed MCTS tree has no root")
+
+        children = {}
+        for item in records.values():
+            parent_id = item.get("parent_population_node_id")
+            if parent_id is not None:
+                children.setdefault(int(parent_id), []).append(item)
+
+        recipe_count = len(self.recipes)
+        candidates = []
+        for item in records.values():
+            if int(item.get("depth", 0)) >= self.max_depth:
+                continue
+            expanded = set(item.get("expanded_recipe_ids", []))
+            if len(expanded) < recipe_count:
+                candidates.append(item)
+        if not candidates:
+            return None
+
+        def uct(item, siblings):
+            q_values = [float(x.get("Q", 0.0)) for x in siblings]
+            q_min = min(q_values, default=float(item.get("Q", 0.0)))
+            q_max = max(q_values, default=float(item.get("Q", 0.0)))
+            q = float(item.get("Q", 0.0))
+            exploit = ((q - q_min) / (q_max - q_min)
+                       if q_max > q_min else 0.0)
+            parent_id = item.get("parent_population_node_id")
+            parent_visits = float(
+                records.get(int(parent_id), {}).get("visits", 1.0)
+                if parent_id is not None else 1.0
+            )
+            visits = max(float(item.get("visits", 1.0)), 1.0)
+            return exploit + self.tree.exploration_constant * math.sqrt(
+                math.log(parent_visits + 1.0) / visits)
+
+        if self.depth_balance_weight == 0.0:
+            current = records[root_id]
+            while children.get(int(current["population_node_id"]), []):
+                current_children = children[int(current["population_node_id"])]
+                if len(set(current.get("expanded_recipe_ids", []))) < recipe_count:
+                    break
+                current = max(
+                    current_children,
+                    key=lambda item: uct(item, current_children),
+                )
+            selected = current
+            if (int(selected.get("depth", 0)) < self.max_depth
+                    and len(set(selected.get("expanded_recipe_ids", []))) < recipe_count):
+                pass
+            else:
+                selected = max(candidates, key=lambda item: float(item.get("Q", 0.0)))
+        else:
+            depth_counts = {}
+            for item in records.values():
+                depth = int(item.get("depth", 0))
+                depth_counts[depth] = depth_counts.get(depth, 0) + 1
+            max_count = max(depth_counts.values(), default=1)
+            deepest = max((int(item.get("depth", 0)) for item in candidates), default=0)
+            selected = max(
+                candidates,
+                key=lambda item: (
+                    uct(item, children.get(int(item["parent_population_node_id"]), []))
+                    if item.get("parent_population_node_id") is not None else float("inf")
+                ) + self.depth_balance_weight * (
+                    (max_count - depth_counts.get(int(item.get("depth", 0)), 0))
+                    / (max_count + 1.0)
+                    + 0.25 * int(item.get("depth", 0)) / max(deepest, 1)
+                ),
+            )
+
+        from .mcts import RecipeNode
+        node = RecipeNode(
+            int(selected["population_node_id"]),
+            float(selected.get("Q", selected.get("best_score", 0.0))),
+            depth=int(selected.get("depth", 0)),
+            incoming_recipe_id=selected.get("incoming_recipe_id"),
+            visits=int(selected.get("visits", 1)),
+            token_usage=selected.get("token_usage"),
+            stagnation_iteration=int(selected.get("stagnation_iteration", 0)),
+            best_score=selected.get("best_score"),
+            score_mean=selected.get("score_mean"),
+            score_std=selected.get("score_std"),
+        )
+        node.parent_population_node_id = selected.get(
+            "parent_population_node_id")
+        node.expanded_recipe_ids = set(selected.get("expanded_recipe_ids", []))
+        return node
+
+    def _write_disk_tree_transition(self, parent_node, children):
+        """Update only the on-disk tree index after a node expansion."""
+        root_id, records = self._disk_tree_records()
+        if root_id is None:
+            root_id = parent_node.population_node_id
+        parent_id = int(parent_node.population_node_id)
+        parent = records.setdefault(parent_id, {
+            "population_node_id": parent_id,
+            "parent_population_node_id": None,
+            "depth": int(parent_node.depth),
+            "Q": float(parent_node.Q),
+            "visits": int(parent_node.visits),
+            "expanded_recipe_ids": [],
+            "incoming_recipe_id": parent_node.incoming_recipe_id,
+            "token_usage": getattr(parent_node, "token_usage", None),
+            "stagnation_iteration": int(parent_node.stagnation_iteration),
+            "best_score": float(parent_node.best_score),
+            "score_mean": parent_node.score_mean,
+            "score_std": parent_node.score_std,
+        })
+        parent["expanded_recipe_ids"] = sorted(
+            set(parent.get("expanded_recipe_ids", [])) |
+            {child.incoming_recipe_id for child in children
+             if child.incoming_recipe_id is not None}
+        )
+        parent["children_population_node_ids"] = sorted(
+            {int(item.get("population_node_id")) for item in records.values()
+             if item.get("parent_population_node_id") == parent_id}
+            | {int(child.population_node_id) for child in children}
+        )
+        for child in children:
+            child_id = int(child.population_node_id)
+            records[child_id] = {
+                "population_node_id": child_id,
+                "parent_population_node_id": parent_id,
+                "depth": int(child.depth),
+                "Q": float(child.Q),
+                "visits": max(int(child.visits), 2),
+                "expanded_recipe_ids": sorted(child.expanded_recipe_ids),
+                "incoming_recipe_id": child.incoming_recipe_id,
+                "token_usage": getattr(child, "token_usage", None),
+                "stagnation_iteration": int(child.stagnation_iteration),
+                "best_score": float(child.best_score),
+                "score_mean": child.score_mean,
+                "score_std": child.score_std,
+            }
+            # RecipeMCTS.backpropagate increments every ancestor once for
+            # each newly created child. Apply the same update to disk
+            # metadata without retaining those ancestors as Python objects.
+            propagated_id = parent_id
+            child_q = float(child.Q)
+            while propagated_id is not None and propagated_id in records:
+                propagated = records[propagated_id]
+                propagated["Q"] = max(float(propagated.get("Q", child_q)),
+                                       child_q)
+                propagated["visits"] = int(propagated.get("visits", 1)) + 1
+                propagated_id = propagated.get("parent_population_node_id")
+        changed_ids = set()
+        current_id = parent_id
+        while current_id is not None and current_id in records:
+            changed_ids.add(current_id)
+            current_id = records[current_id].get(
+                "parent_population_node_id")
+        changed_ids.update(int(child.population_node_id) for child in children)
+        self._set_pending_tree_state(root_id, records, changed_ids)
 
     def restore(self, checkpoint):
         """Restore tree metadata and RNG state for continued training."""
@@ -564,12 +929,42 @@ class MCTSRecipe:
             if self.elite_pool_size < 0:
                 raise ValueError("checkpoint elite_pool_size must be >= 0")
             self.use_elite_pool = self.elite_pool_size > 0
-        self._elite_pool = (self._load_elite_pool(state.get("elite_algorithm_ids"))
+            self._elite_pool = (self._load_elite_pool(state.get("elite_algorithm_ids"))
                             if self.use_elite_pool else [])
-        root, _ = restore_tree(state)
-        if root is None:
-            raise ValueError("checkpoint does not contain a root node")
-        self.tree.root = root
+        adaptive_state = state.get("adaptive")
+        if isinstance(adaptive_state, dict):
+            self.adaptive_enabled = bool(
+                adaptive_state.get("enabled", self.adaptive_enabled))
+            self.adaptive_recipe_count = int(
+                adaptive_state.get("recipes_per_expansion",
+                                   self.adaptive_recipe_count))
+            if self.adaptive_enabled and self.adaptive_router is None:
+                self.adaptive_router = ContextualThompsonRouter(
+                    self.recipes.keys(),
+                    prior_precision=float(adaptive_state.get(
+                        "prior_precision", 1.0)),
+                    posterior_scale=float(adaptive_state.get(
+                        "posterior_scale", 0.5)),
+                )
+            if self.adaptive_router is not None:
+                self.adaptive_router.load_state_dict(
+                    adaptive_state.get("router", {}))
+        if self._disk_tree_mode:
+            tree_state = self.store.load_tree_state()
+            if tree_state.get("root_id") is None and state.get("nodes"):
+                nodes = list(state.get("nodes", []))
+                root_id = state.get("tree_root_id")
+                if root_id is None:
+                    root_id = nodes[0].get("population_node_id")
+                self.store.write_tree_state(root_id, nodes)
+            self.tree.root = None
+            self._tree_root_id = self.store.load_tree_state().get("root_id")
+            self._pending_tree_updates = {}
+        else:
+            root, _ = restore_tree(state)
+            if root is None:
+                raise ValueError("checkpoint does not contain a root node")
+            self.tree.root = root
         self._next_population_node_id = int(
             state.get("next_population_node_id",
                       state.get("last_population_node_id", 0) + 1))
@@ -593,7 +988,13 @@ class MCTSRecipe:
         path = os.path.join(self.store.directory,
                             f"checkpoint_{self._checkpoint_index:06d}.json")
         nodes = []
-        if self.tree.root is not None:
+        if self._disk_tree_mode:
+            # The historical tree index remains in tree_state.json. The
+            # checkpoint stores only its location and root ID.
+            tree_root_id = self._tree_root_id
+            if tree_root_id is None:
+                tree_root_id = self.store.load_tree_state().get("root_id")
+        elif self.tree.root is not None:
             stack = [self.tree.root]
             while stack:
                 node = stack.pop()
@@ -607,8 +1008,16 @@ class MCTSRecipe:
                     "expanded_recipe_ids": sorted(node.expanded_recipe_ids),
                     "incoming_recipe_id": node.incoming_recipe_id,
                     "token_usage": getattr(node, "token_usage", None),
+                    "stagnation_iteration": getattr(
+                        node, "stagnation_iteration", 0),
+                    "best_score": getattr(node, "best_score", node.Q),
+                    "score_mean": getattr(node, "score_mean", None),
+                    "score_std": getattr(node, "score_std", None),
                 })
                 stack.extend(node.children)
+            tree_root_id = self.tree.root.population_node_id
+        else:
+            tree_root_id = None
         state = {
             # The counter always points to the next unused ID.  Keep both
             # fields for compatibility with older checkpoints.
@@ -630,7 +1039,21 @@ class MCTSRecipe:
             "exploration_constant": self.tree.exploration_constant,
             "depth_balance_weight": self.tree.depth_balance_weight,
             "nodes": nodes,
+            "tree_root_id": tree_root_id,
             "recipes": {k: v.values for k, v in self.recipes.items()},
+            "adaptive": {
+                "enabled": self.adaptive_enabled,
+                "recipes_per_expansion": self.adaptive_recipe_count,
+                "prior_precision": (
+                    self.adaptive_router.prior_precision
+                    if self.adaptive_router is not None else None),
+                "posterior_scale": (
+                    self.adaptive_router.posterior_scale
+                    if self.adaptive_router is not None else None),
+                "router": (
+                    self.adaptive_router.state_dict()
+                    if self.adaptive_router is not None else None),
+            },
             # Pickled/base64 states preserve exact Python and NumPy RNG state;
             # they are local checkpoint data, not executable input.
             "python_random_state": self._encode_state(random.getstate()),

@@ -10,6 +10,7 @@ import numpy as np
 
 from llm4ad.base import Evaluation
 from .get_instance import GetData
+from .template import task_description, template_program
 
 __all__ = ["TSPEvaluation", "RefineEVOTSPEvaluation"]
 
@@ -19,7 +20,9 @@ class TSPEvaluation(Evaluation):
 
     def __init__(self, timeout_seconds=30, n_instance=50, problem_size=100,
                  dataset_path: str | Path | None = None, seed=2024, **kwargs):
-        super().__init__(use_numba_accelerate=False,
+        super().__init__(template_program=template_program,
+                         task_description=task_description,
+                         use_numba_accelerate=False,
                          timeout_seconds=timeout_seconds)
         strict_recipe_dataset_format = bool(
             kwargs.pop("strict_recipe_dataset_format", False))

@@ -2,26 +2,47 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
+import threading
+
+from .tree_index import DiskTreeIndex
 
 
 class RecipeStore:
     """Batch persistence for population snapshots and MCTS checkpoints."""
 
-    def __init__(self, directory, batch_size=10):
+    def __init__(self, directory, batch_size=100):
         self.directory = os.path.abspath(directory)
         self.batch_size = int(batch_size)
         self.buffer = []
+        self._lock = threading.RLock()
+        self._tree_index = DiskTreeIndex(self.directory)
+        # This is a persistence-record counter, not a population node id.
+        # It keeps the filename format population_nodes_000001~000010.json
+        # while allowing real node ids to have gaps.
         self.next_file_start = 1
         os.makedirs(self.directory, exist_ok=True)
         for name in os.listdir(self.directory):
-            if name.startswith("population_nodes_") and name.endswith(".json"):
-                try:
-                    self.next_file_start = max(
-                        self.next_file_start,
-                        int(name[:-5].rsplit("~", 1)[1]) + 1)
-                except (ValueError, IndexError):
-                    pass
+            old_format = re.match(
+                r"^population_nodes_(\d+)~(\d+)\.json$", name)
+            new_format = re.match(
+                r"^population_nodes_batch_\d+_(\d+)~(\d+)\.json$", name)
+            match = old_format or new_format
+            if match:
+                self.next_file_start = max(
+                    self.next_file_start, int(match.group(2)) + 1)
+
+    def has_population_nodes(self):
+        """Return whether this directory already contains node snapshots."""
+        with self._lock:
+            if self.buffer:
+                return True
+            return any(
+                name.startswith("population_nodes_")
+                and name.endswith(".json")
+                for name in os.listdir(self.directory)
+            )
 
     @staticmethod
     def _algorithm_record(individual):
@@ -44,8 +65,8 @@ class RecipeStore:
         }
 
     def add(self, node_id, parent_id, depth, recipe_id, generation, population,
-            experiences=None, token_usage=None):
-        self.buffer.append({
+            experiences=None, token_usage=None, extra=None):
+        record = {
             "population_node_id": node_id,
             "parent_population_node_id": parent_id,
             "depth": depth,
@@ -56,17 +77,33 @@ class RecipeStore:
             "token_usage": token_usage,
             "algorithms": [self._algorithm_record(x) for x in population.individuals],
             "experiences": list(experiences or []),
-        })
-        if len(self.buffer) >= self.batch_size:
-            return self.flush()
-        return None
+        }
+        if extra:
+            record.update(extra)
+        # Parallel recipe branches enter here independently. The lock makes
+        # the count-and-flush operation atomic: exactly batch_size completed
+        # node records are written together.
+        with self._lock:
+            self.buffer.append(record)
+            if len(self.buffer) >= self.batch_size:
+                return self._flush_locked()
+            return None
 
     def flush(self):
+        with self._lock:
+            return self._flush_locked()
+
+    def _flush_locked(self):
         if not self.buffer:
             return None
+        # Filename ranges are persistence-record ranges. Real population ids
+        # are stored in each record and load_node never relies on this name.
         start = self.next_file_start
         end = start + len(self.buffer) - 1
-        path = os.path.join(self.directory, f"population_nodes_{start:06d}~{end:06d}.json")
+        path = os.path.join(
+            self.directory,
+            f"population_nodes_{start:06d}~{end:06d}.json",
+        )
         fd, tmp = tempfile.mkstemp(prefix=".population_nodes_", dir=self.directory)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -82,21 +119,46 @@ class RecipeStore:
     def load_node(self, node_id):
         """Load one node without retaining all historical populations in RAM."""
         node_id = int(node_id)
-        for record in self.buffer:
-            if int(record["population_node_id"]) == node_id:
-                return record
-        prefix = "population_nodes_"
-        for name in os.listdir(self.directory):
-            if not name.startswith(prefix) or not name.endswith(".json"):
-                continue
-            bounds = name[len(prefix):-5].split("~")
-            if len(bounds) != 2 or not (int(bounds[0]) <= node_id <= int(bounds[1])):
-                continue
-            with open(os.path.join(self.directory, name), encoding="utf-8") as f:
-                for record in json.load(f).get("nodes", []):
+        with self._lock:
+            for record in self.buffer:
+                if int(record["population_node_id"]) == node_id:
+                    return record
+
+            # Filename ranges are persistence-record ranges, not population
+            # node ids. Scan file contents so gaps and parallel completion
+            # order never affect node recovery.
+            prefix = "population_nodes_"
+            paths = sorted(
+                os.path.join(self.directory, name)
+                for name in os.listdir(self.directory)
+                if name.startswith(prefix) and name.endswith(".json")
+            )
+            for path in paths:
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        records = json.load(f).get("nodes", [])
+                except (FileNotFoundError, json.JSONDecodeError, OSError):
+                    continue
+                for record in records:
                     if int(record["population_node_id"]) == node_id:
                         return record
         raise KeyError(f"Population node {node_id} is not persisted")
+
+    @property
+    def tree_state_path(self):
+        return os.path.join(self.directory, "tree_state.json")
+
+    def load_tree_state(self):
+        """Load the small disk-backed MCTS index.
+
+        The index contains only search metadata. Population and algorithm
+        records remain in the node snapshot files and are loaded on demand.
+        """
+        return self._tree_index.load("population_node_id")
+
+    def write_tree_state(self, root_id, nodes):
+        self._tree_index.write(
+            root_id, nodes, node_id_field="population_node_id")
 
     def load_algorithm_records(self, algorithm_ids):
         """Resolve selected lineage parents without retaining historical nodes."""
@@ -175,10 +237,11 @@ class RecipeStore:
             records = []
         return records if isinstance(records, list) else []
 
-    def write_convergence_records(self, records):
+    def write_convergence_records(self, records, x_axis="algorithm_id",
+                                  y_axis="best_score_so_far"):
         payload = {
-            "x_axis": "algorithm_id",
-            "y_axis": "best_score_so_far",
+            "x_axis": x_axis,
+            "y_axis": y_axis,
             "records": list(records),
         }
         fd, tmp = tempfile.mkstemp(prefix=".overall_convergence_",
@@ -191,17 +254,18 @@ class RecipeStore:
             if os.path.exists(tmp):
                 os.remove(tmp)
 
-    def write_convergence_plot(self, records):
+    def write_convergence_plot(self, records, x_axis="algorithm_id",
+                               y_axis="best_score_so_far"):
         points = []
         for record in records:
             if not isinstance(record, dict):
                 continue
-            algorithm_id = record.get("algorithm_id")
-            best_score = record.get("best_score_so_far", record.get("best_score"))
-            if algorithm_id is None or best_score is None:
+            x_value = record.get(x_axis)
+            y_value = record.get(y_axis, record.get("best_score"))
+            if x_value is None or y_value is None:
                 continue
             try:
-                points.append((int(algorithm_id), float(best_score)))
+                points.append((int(x_value), float(y_value)))
             except (TypeError, ValueError):
                 continue
         if not points:
@@ -217,8 +281,8 @@ class RecipeStore:
         fig, ax = plt.subplots(figsize=(9.5, 5.5))
         ax.step(x_values, y_values, where="post", linewidth=1.8)
         ax.scatter([x_values[-1]], [y_values[-1]], s=26, zorder=3)
-        ax.set_xlabel("Algorithm ID")
-        ax.set_ylabel("Best score so far")
+        ax.set_xlabel("Sample Order" if x_axis == "sample_order" else "Algorithm ID")
+        ax.set_ylabel("Best So Far" if y_axis == "best_so_far" else "Best score so far")
         ax.set_title("Global convergence")
         ax.grid(True, alpha=0.28)
         if len(x_values) == 1:
@@ -235,6 +299,20 @@ class RecipeStore:
             if os.path.exists(tmp):
                 os.remove(tmp)
         return self.convergence_plot_path
+
+    @property
+    def token_usage_path(self):
+        return os.path.join(self.directory, "token_usage_total.json")
+
+    def write_token_usage(self, usage):
+        fd, tmp = tempfile.mkstemp(prefix=".token_usage_", dir=self.directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(dict(usage or {}), f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self.token_usage_path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
 
     @property
     def elite_pool_path(self):

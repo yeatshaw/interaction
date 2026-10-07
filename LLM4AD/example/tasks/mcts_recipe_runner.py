@@ -501,7 +501,8 @@ def _initial_population_eoh(llm, evaluation, info, pop_size, selection_num=2,
 
 def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
                         num_samplers=1, debug=False, on_evaluated=None,
-                        reserve_sample_order=None, init_pop_size=None):
+                        reserve_sample_order=None, init_pop_size=None,
+                        admit_sample_order=None):
     """Run RefineEvo's complete initialization pipeline.
 
     RefineEvo does not immediately accept the first ``pop_size`` feasible
@@ -544,8 +545,7 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
         # population management.
         last_error = None
         for _ in range(5):
-            sample_order = (reserve_sample_order()
-                            if reserve_sample_order is not None else None)
+            sample_order = None
             sample_start = time.time()
             evolution_usage = None
             token_usage = None
@@ -569,6 +569,10 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
                 program = None
             if program is None:
                 continue
+            if admit_sample_order is not None:
+                sample_order = admit_sample_order()
+            elif reserve_sample_order is not None:
+                sample_order = reserve_sample_order()
             score, eval_time = evaluator.evaluate_program_record_time(program)
             if score is None or not isinstance(score, (int, float)) \
                     or not math.isfinite(float(score)):
@@ -664,10 +668,10 @@ def run_task(*, method_name, template_module, evaluation, llm,
              init_pop_size=30, debug=False, elite_pool_size=0,
              checkpoint=None, mode="reflection", operators=None,
              embedding_config=None, exploration_constant=0.1,
-             depth_balance_weight=0.2, node_batch_size=10, seed=None,
+             depth_balance_weight=0.2, node_batch_size=100, seed=None,
              experiment_config=None, initialization_mode="refineevo",
              initial_sample_nums_max=None, task_type=None,
-             post_training_test_config=None):
+             post_training_test_config=None, adaptive_config=None):
     from example.tasks.utils import get_info
 
     info = get_info(method_name, template_module)
@@ -726,6 +730,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
             "seed": seed,
             "task_type": task_type,
             "post_training_test_config": post_training_test_config,
+            "adaptive_config": adaptive_config,
         },
         recipes=recipes,
     )
@@ -785,6 +790,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
         seed=(None if seed is None else int(seed)),
         max_sample_count=max_sample_count,
         elite_pool_size=elite_pool_size,
+        adaptive_config=adaptive_config,
     )
     try:
         if checkpoint:
@@ -870,8 +876,9 @@ def common_options(default_log, config=None):
         "embedding_config": _section(config, "embedding"),
         "exploration_constant": float(mcts_config.get("exploration_constant", 0.1)),
         "depth_balance_weight": float(mcts_config.get("depth_balance_weight", 0.2)),
-        "node_batch_size": int(mcts_config.get("node_batch_size", 10)),
+        "node_batch_size": int(mcts_config.get("node_batch_size", 100)),
         "seed": mcts_config.get("seed"),
         "experiment_config": config,
         "post_training_test_config": test_config(config),
+        "adaptive_config": _section(config, "adaptive"),
     }

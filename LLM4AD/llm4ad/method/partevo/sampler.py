@@ -63,7 +63,7 @@ class PartEvoSampler:
         # Parse the algorithmic concept (thought) from the response
         thought = self.__class__.trim_thought_from_response(response)
         # Extract the code block and convert it into an executable Function instance
-        code = SampleTrimmer.trim_preface_of_function(response)
+        code = self.__class__.trim_code_from_response(response)
         function = SampleTrimmer.sample_to_function(code, self._template_program)
         return thought, function, response
 
@@ -93,20 +93,36 @@ class PartEvoSampler:
 
     @classmethod
     def trim_thought_from_response(cls, response: str) -> str | None:
-        """
-        Extracts content within <concept>...</concept> tags.
-        This corresponds to the 'algorithmic concept' requested in the Prompt.
-        """
+        """Parse the EoH-style thought field, with legacy concept-tag support."""
         try:
-            pattern = r'<concept>(.*?)</concept>'
-            match = re.search(pattern, response, re.DOTALL)
-
+            match = re.search(r'(?is)\bthought\s*:\s*\{(.*?)\}', response)
             if match:
                 return match.group(1).strip()
+            match = re.search(r'<concept>(.*?)</concept>', response,
+                              re.DOTALL | re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            match = re.search(r'(?s)\{(.*?)\}', response)
+            return match.group(1).strip() if match else None
+        except Exception:
             return None
-        except Exception as e:
-            print(f"Error in trim_thought_from_response: {e}")
-            return None
+
+    @classmethod
+    def trim_code_from_response(cls, response: str) -> str:
+        """Extract the emitted function from a fenced or plain Code section."""
+        if not isinstance(response, str):
+            return ""
+        blocks = re.findall(
+            r'```(?:python)?\s*(.*?)```', response,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        code = next((block for block in blocks if re.search(
+            r'^\s*def\s+', block, flags=re.MULTILINE)), None)
+        if code is None:
+            marker = re.search(r'(?im)^\s*Code\s*:\s*$', response)
+            code = response[marker.end():] if marker else response
+        code = re.sub(r'^\s*Code\s*:\s*\n?', '', code, flags=re.IGNORECASE)
+        return SampleTrimmer.trim_preface_of_function(code)
 
     @classmethod
     def trim_reflection_from_response(cls, response: str) -> str | None:

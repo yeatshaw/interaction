@@ -1,6 +1,7 @@
 """Recipe-level MCTS for EoH; kept separate from :mod:`mcts_ahd`."""
 
 from .mcts_recipe import MCTSRecipe
+from .mcts_partevo_recipe import MCTSPartEvoRecipe, PartEvoBranch
 from .eoh_adapter import (
     EoHRecipeExpander,
     NoReflectionEoHRecipeExpander,
@@ -9,6 +10,7 @@ from .eoh_adapter import (
 from .refineevo_experience import RefineEvoExperienceManager
 from .recipes import DEFAULT_RECIPES, get_default_recipes, validate_recipes
 
-__all__ = ["MCTSRecipe", "EoHRecipeExpander", "NoReflectionEoHRecipeExpander", "RefineEvoRecipeExpander",
+__all__ = ["MCTSRecipe", "MCTSPartEvoRecipe", "PartEvoBranch",
+           "EoHRecipeExpander", "NoReflectionEoHRecipeExpander", "RefineEvoRecipeExpander",
            "RefineEvoExperienceManager"]
 __all__ += ["DEFAULT_RECIPES", "get_default_recipes", "validate_recipes"]

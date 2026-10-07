@@ -1,0 +1,67 @@
+"""Editable FunSearch configuration for constructive TSP."""
+
+FUNSEARCH_CONFIG = {
+    "log_dir": "logs/funsearch_tsp",
+    "max_sample_nums": 10000,
+    "samples_per_prompt": 5,
+    "num_samplers": 5,
+    "num_evaluators": 5,
+    "multi_thread_or_process_eval": "thread",
+    "resume_mode": False,
+    "debug_mode": False,
+    "profiler_log_style": "complex",
+    "program_db_register_interval": 100,
+    "checkpoint_interval": 100,
+    "checkpoint_path": None,
+    "convergence_csv_path": None,
+    "convergence_png_path": None,
+    "llm": {
+        "host": "api.apilio.ai",
+        "api_key": "sk-fpYg2WDIAe8JKnlOQpP2BQROfzONm6HXFg14u8EAu5G2ymcM",
+        "api_key_env": "LLM4AD_API_KEY",
+        "model": "gpt-4o-mini",
+        "timeout": 60,
+    },
+    "evaluation": {
+        "timeout_seconds": 300,
+        "n_instance": 50,
+        "problem_size": 100,
+        # Set this to a pickle path to use a fixed training set.
+        "dataset_path": None,
+        "seed": 2024,
+    },
+    "tree_reflection": {
+        "enabled": True,
+        "reference_mode": "best",
+        "adaptive_recipe_selection": True,
+        "recipes": (
+            "full_difference_guidance",
+            "attribution_both_conditions",
+            "attribution_good",
+            "comparison_only",
+            "refineevo_experience",
+        ),
+        "prior_precision": 1.0,
+        "posterior_scale": 0.5,
+        "reward_scale": 1.0,
+        "max_parent_context": 2,
+        "experience_top_k": 3,
+        "experience_path": None,
+        "embedding": {
+            "enabled": True,
+            "base_url": "https://api.apilio.ai/v1",
+            "api_key": "sk-fpYg2WDIAe8JKnlOQpP2BQROfzONm6HXFg14u8EAu5G2ymcM",
+            "api_key_env": (
+                "LLM4AD_EMBEDDING_API_KEY",
+                "LLM4AD_API_KEY",
+            ),
+            "model": "text-embedding-v4",
+            "encoding_format": "float",
+            "timeout": 60,
+        },
+        # None means save under the profiler log directory.
+        "tree_path": None,
+        "stats_path": None,
+        "tree_persist_interval": 100,
+    },
+}

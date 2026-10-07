@@ -89,10 +89,12 @@ class ProfilerBase:
     def register_function(self, function: Function, program: str = '', *, resume_mode=False):
         """Record an obtained function.
         """
+        sample_order = None
         if self._num_objs < 2:
             try:
                 self._register_function_lock.acquire()
                 self._num_samples += 1
+                sample_order = self._num_samples
                 self._record_and_print_verbose(function, resume_mode=resume_mode)
                 if not resume_mode:
                     self._write_json(function, program)
@@ -102,11 +104,13 @@ class ProfilerBase:
             try:
                 self._register_function_lock.acquire()
                 self._num_samples += 1
+                sample_order = self._num_samples
                 self._record_and_print_verbose(function, resume_mode=resume_mode)
                 if not resume_mode:
                     self._write_json(function, program)
             finally:
                 self._register_function_lock.release()
+        return sample_order
 
     def finish(self):
         pass

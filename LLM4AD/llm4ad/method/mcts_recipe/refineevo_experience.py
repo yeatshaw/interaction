@@ -15,6 +15,11 @@ OPERATOR_GOALS = {
     "e2": "Please refer to the given suggestions and identify the common backbone idea in the provided methods and help me create a new algorithm that has a totally different form from the given ones but can be motivated from them.",
     "m1": "Please refer to the given suggestions and assist me in creating a new algorithm that has a different form but can be a modified version of the algorithm provided.",
     "m2": "Please refer to the given suggestions and identify the main algorithm parameters and assist me in creating a new algorithm that has different parameter settings of the score function provided.",
+    "re": "Use reflection on the selected niche algorithm and its evolutionary history to design an improved algorithm.",
+    "se": "Use global semantic insights together with the selected niche algorithm to explore a promising new algorithm.",
+    "cn": "Combine complementary ideas from algorithms in different niches to synthesize a stronger algorithm.",
+    "cc": "Combine complementary ideas from algorithms in different niches to synthesize a stronger algorithm.",
+    "lge": "Improve the selected algorithm using both its niche best and the global best as guidance.",
 }
 
 

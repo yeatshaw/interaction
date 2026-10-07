@@ -108,18 +108,6 @@ def _resume_pf(log_path: str, pf: FunSearchProfiler, template_func: Function):
 
 
 def resume_funsearch(fs: FunSearch):
+    """Backward-compatible wrapper around the checkpoint restore flow."""
     fs._resume_mode = True
-    pf = fs._profiler  # noqa
-    log_path = pf._log_dir  # noqa
-    # resume program database
-    template = tfpc.text_to_program(fs._template_program_str)  # noqa
-    template_func = fs._function_to_evolve
-    config = fs._config.programs_database  # noqa
-    func_to_evol = fs._function_to_evolve_name  # noqa
-    db = _resume_db(log_path, config, template, func_to_evol)
-    fs._database = db
-    # resume profiler
-    _resume_pf(log_path, pf, template_func)
-    # resume funsearch
-    _, _, sample_max_order = _get_all_samples_and_scores(log_path)
-    fs._tot_sample_nums = sample_max_order
+    fs.restore_from_checkpoint()

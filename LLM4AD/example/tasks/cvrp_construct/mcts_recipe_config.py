@@ -1,5 +1,10 @@
 """Editable Recipe-MCTS configuration for the CVRP task."""
 
+from pathlib import Path
+
+
+TASK_DIR = Path(__file__).resolve().parent
+
 MCTS_RECIPE_CONFIG = {
     "log_dir": "logs/mcts_recipe_cvrp",
     "checkpoint": None,
@@ -17,10 +22,18 @@ MCTS_RECIPE_CONFIG = {
         "num_evaluators": 10,
         "exploration_constant": 0.1,
         "depth_balance_weight": 0.2,
-        "node_batch_size": 10,
+        "node_batch_size": 100,
         "seed": None,
         "elite_pool_size": 0,
         "debug": False,
+    },
+    "adaptive": {
+        "enabled": False,
+        "recipes_per_expansion": 3,
+        "prior_precision": 1.0,
+        "posterior_scale": 0.5,
+        "reward_best_weight": 0.8,
+        "reward_mean_weight": 0.2,
     },
     "llm": {
         "host": "api.apilio.ai",
@@ -42,14 +55,12 @@ MCTS_RECIPE_CONFIG = {
         "problem_size": 100,
         "n_instance": 50,
         "capacity": 40,
-        "dataset_path": None,
+        "dataset_path": str(TASK_DIR / "cvrp_instances_train_n100c50.pkl"),
     },
     "test": {
         "enabled": True,
         "task": "cvrp",
-        "data_paths": [
-            r"D:\A_Shaw\Academic\Files\program\interaction\LLM4AD\example\tasks\cvrp_construct\cvrp_instances_test_n200c50.pkl",
-        ],
+        "data_paths": [str(TASK_DIR / "cvrp_instances_test_n200c50.pkl")],
         "output": "cvrp_test_results.csv",
         "max_nodes": 0,
         "instance_timeout": 1800,

@@ -89,6 +89,10 @@ class ProgramsDatabase:
         self._best_program_per_island: list[Function | None] = ([None] * config.num_islands)
         self._best_scores_per_test_per_island: list[Any | None] = ([None] * config.num_islands)
         self._last_reset_time: float = time.time()
+        self._reset_callback = None
+
+    def set_reset_callback(self, callback) -> None:
+        self._reset_callback = callback
 
     def get_prompt(self) -> Prompt:
         """Returns a prompt containing implementations from one chosen island."""
@@ -144,6 +148,7 @@ class ProgramsDatabase:
         num_islands_to_reset = self._config.num_islands // 2
         reset_islands_ids = indices_sorted_by_score[:num_islands_to_reset]
         keep_islands_ids = indices_sorted_by_score[num_islands_to_reset:]
+        reset_records = []
         for island_id in reset_islands_ids:
             self._islands[island_id] = Island(
                 self._template,
@@ -156,6 +161,9 @@ class ProgramsDatabase:
             founder = self._best_program_per_island[founder_island_id]
             founder_scores = self._best_scores_per_test_per_island[founder_island_id]
             self._register_function_in_island(founder, island_id, founder_scores)
+            reset_records.append((int(island_id), founder, founder_scores))
+        if self._reset_callback is not None:
+            self._reset_callback(reset_records)
 
 
 class Island:

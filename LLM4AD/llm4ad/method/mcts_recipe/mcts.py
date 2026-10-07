@@ -7,7 +7,9 @@ class RecipeNode:
     """Lightweight in-memory tree node; full populations live on disk."""
 
     def __init__(self, population_node_id, q, depth=0, parent=None,
-                 incoming_recipe_id=None, visits=1, token_usage=None):
+                 incoming_recipe_id=None, visits=1, token_usage=None,
+                 stagnation_iteration=0, best_score=None, score_mean=None,
+                 score_std=None):
         self.population_node_id = int(population_node_id)
         self.parent_population_node_id = (
             parent.population_node_id if parent is not None else None)
@@ -19,6 +21,10 @@ class RecipeNode:
         self.expanded_recipe_ids = set()
         self.incoming_recipe_id = incoming_recipe_id
         self.token_usage = dict(token_usage or {})
+        self.stagnation_iteration = int(stagnation_iteration or 0)
+        self.best_score = float(q if best_score is None else best_score)
+        self.score_mean = None if score_mean is None else float(score_mean)
+        self.score_std = None if score_std is None else float(score_std)
 
     def add_child(self, child):
         self.children.append(child)

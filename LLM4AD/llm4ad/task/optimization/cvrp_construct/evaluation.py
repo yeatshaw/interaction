@@ -8,6 +8,7 @@ import numpy as np
 
 from llm4ad.base import Evaluation
 from .get_instance import GetData
+from .template import task_description, template_program
 
 
 class _NumpyCompatUnpickler(pickle.Unpickler):
@@ -24,7 +25,9 @@ class CVRPEvaluation(Evaluation):
 
     def __init__(self, timeout_seconds=30, problem_size=100, n_instance=50,
                  capacity=40, dataset_path: str | Path | None = None, **kwargs):
-        super().__init__(use_numba_accelerate=False,
+        super().__init__(template_program=template_program,
+                         task_description=task_description,
+                         use_numba_accelerate=False,
                          timeout_seconds=timeout_seconds)
         self.dataset_path = dataset_path or os.environ.get("LLM4AD_CVRP_TRAIN_DATA")
         self.problem_size = problem_size

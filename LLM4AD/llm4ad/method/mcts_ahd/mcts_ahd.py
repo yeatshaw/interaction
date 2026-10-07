@@ -181,6 +181,8 @@ class MCTS_AHD:
         if program is None:
             return False
         # evaluate
+        if not self._on_evaluation_start():
+            return False
         score, eval_time = self._evaluation_executor.submit(
             self._evaluator.evaluate_program_record_time,
             program
@@ -194,7 +196,7 @@ class MCTS_AHD:
             self._profiler.register_function(func, program=str(program))
             if isinstance(self._profiler, MAProfiler):
                 self._profiler.register_population(self._population)
-            self._tot_sample_nums += 1
+        self._increment_sample_count()
         if func_only:
             return func
         if func.score is None:
@@ -203,6 +205,18 @@ class MCTS_AHD:
         self._population.register_function(func)
 
         return True
+
+    def _on_evaluation_start(self):
+        """Hook called after parsing and immediately before evaluation."""
+        return True
+
+    def _increment_sample_count(self):
+        """Increment the completed sample count.
+
+        A subclass may reserve a global sample slot before generation and
+        override this hook because that reservation already owns the count.
+        """
+        self._tot_sample_nums += 1
 
     def _continue_loop(self) -> bool:
         if self._max_sample_nums is None:
@@ -359,7 +373,8 @@ class MCTS_AHD:
         """Let a thread repeat {sample -> evaluate -> register to population}
         to initialize a population.
         """
-        while len(self._population.population) < self._init_pop_size:
+        while (len(self._population.population) < self._init_pop_size
+               and self._continue_loop()):
             try:
                 # get a new func using e1
                 prompt = MAPrompt.get_prompt_e1(self._task_description_str, self._population.population,
@@ -380,7 +395,8 @@ class MCTS_AHD:
                 continue
 
     def _init_one_solution(self):
-        while len(self._population.next_gen_pop) == 0:
+        while (len(self._population.next_gen_pop) == 0
+               and self._continue_loop()):
             try:
                 # get a new func using i1
                 prompt = MAPrompt.get_prompt_i1(self._task_description_str, self._function_to_evolve)

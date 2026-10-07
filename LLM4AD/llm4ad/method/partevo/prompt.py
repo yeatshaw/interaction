@@ -50,6 +50,26 @@ class PartEvoPrompt:
     def get_system_prompt(cls) -> str:
         return ''
 
+    @staticmethod
+    def _algorithm_output_requirements(template_function: 'Function') -> str:
+        return f'''### Required Output Format
+Your final answer must match this format exactly:
+
+thought:{{...}}
+```python
+Code:
+{str(template_function)}
+```
+
+Requirements:
+- Keep the function name, arguments, and return type exactly as shown in the template.
+- Replace the `...` inside `thought:{{...}}` with one concise sentence.
+- Replace only the function implementation with your new algorithm.
+- Put every required import inside the function body before its first use.
+- Do not rely on hidden global variables, class fields, or unavailable helper methods.
+- Do not output <concept>, <thought>, analysis, explanations, or any additional sections.
+- Do not add any markdown fences other than the single required python fence.'''
+
     @classmethod
     def get_prompt_batch_init(cls, task_prompt: str, template_function: 'Function',
                               current_population: List['Function'],
@@ -68,8 +88,8 @@ class PartEvoPrompt:
             "Your task is to design a novel and executable algorithm to solve a given problem. "
             "It is crucial that your core methodology and algorithmic logic are highly distinct from any previously proposed solutions (if provided).\n\n"
             "You may reason and organize your thoughts freely, but your FINAL OUTPUT must strictly adhere to the following format:\n"
-            "1) A concise summary of your new algorithm concept wrapped EXACTLY inside <concept> and </concept> tags.\n"
-            "2) A valid Python implementation of the algorithm."
+            "1) A concise algorithm description in the required thought field.\n"
+            "2) A valid Python implementation in the required code block."
         )
         messages.append({"role": "system", "content": system_prompt})
 
@@ -111,18 +131,11 @@ Step 1 -- Propose a Novel Algorithmic Concept
 - Clearly describe the core mechanism of your new algorithm.
 - Focus on the fundamental reasoning principle.
 - Keep it concise but precise.
-- Wrap the description EXACTLY inside:
-<concept>
-...
-</concept>
+- Describe the design idea in one concise sentence.
 
 Step 2 — Implement the Algorithm  
-- Implement your proposed algorithm using the exact Python function template provided below:
-```python
-{str(temp_func)}
-```
-- Do NOT modify the function name, arguments, or return type.
-- Place all necessary `import` statements inside the function body.
+- Implement the proposed algorithm using the exact Python function template below.
+{cls._algorithm_output_requirements(temp_func)}
 """
 
         content.append({
@@ -300,8 +313,8 @@ Example format:
             "You are an elite algorithm design expert. Your task is to analyze a previous algorithmic attempt "
             "and expert feedback (if provided), and then design a new, superior algorithm.\n"
             "You may reason and organize your thoughts freely, but your FINAL OUTPUT must strictly adhere to the following format:\n"
-            "1) A concise summary of your new algorithm concept wrapped EXACTLY inside <concept> and </concept> tags.\n"
-            "2) A valid Python implementation of the algorithm."
+            "1) A concise algorithm description in the required thought field.\n"
+            "2) A valid Python implementation in the required code block."
         )
 
         messages.append({"role": "system", "content": system_prompt})
@@ -341,18 +354,11 @@ Step 1 -- Propose a New Algorithmic Concept
 - Clearly describe the core mechanism of your algorithm.
 - Focus on the fundamental reasoning principle.
 - Keep it concise but precise.
-- Wrap the description EXACTLY inside:
-<concept>
-...
-</concept>
+- Describe the design idea in one concise sentence.
 
 Step 2 — Implement the Algorithm  
-- Implement your proposed algorithm using the exact Python function template provided below:
-```python
-{str(temp_func)}
-```
-- Do NOT modify the function name, arguments, or return type.
-- Place all necessary `import` statements inside the function body.
+- Implement the proposed algorithm using the exact Python function template below.
+{cls._algorithm_output_requirements(temp_func)}
 """
         content.append({
             "type": "text",
@@ -387,8 +393,8 @@ Step 2 — Implement the Algorithm
             "1) The current algorithmic attempt and its implementation.\n"
             "2) High-level global insights extracted from prior experiments.\n\n"
             "You may reason and organize your thoughts freely, but your FINAL OUTPUT must strictly adhere to the following format:\n"
-            "1) A concise summary of your new algorithm concept wrapped EXACTLY inside <concept> and </concept> tags.\n"
-            "2) A valid Python implementation of the algorithm."
+            "1) A concise algorithm description in the required thought field.\n"
+            "2) A valid Python implementation in the required code block."
         )
         messages.append({"role": "system", "content": system_prompt})
 
@@ -429,18 +435,11 @@ Step 1 -- Propose a New Algorithmic Concept
 - Clearly describe the core mechanism of your algorithm.
 - Focus on the fundamental reasoning principle.
 - Keep it concise but precise.
-- Wrap the description EXACTLY inside:
-<concept>
-...
-</concept>
+- Describe the design idea in one concise sentence.
 
 Step 2 — Implement the Algorithm  
-- Implement your proposed algorithm using the exact Python function template provided below:
-```python
-{str(temp_func)}
-```
-- Do NOT modify the function name, arguments, or return type.
-- Place all necessary `import` statements inside the function body.
+- Implement the proposed algorithm using the exact Python function template below.
+{cls._algorithm_output_requirements(temp_func)}
 """
         content.append({
             "type": "text",
@@ -467,8 +466,8 @@ Step 2 — Implement the Algorithm
             "Your task is to review multiple existing algorithms, use the primary one as your foundation, "
             "and intelligently graft or integrate the advantageous characteristics of the others to synthesize a new, superior algorithm."
             "You may reason and organize your thoughts freely, but your FINAL OUTPUT must strictly adhere to the following format:\n"
-            "1) A concise summary of your hybridized algorithm concept wrapped EXACTLY inside <concept> and </concept> tags.\n"
-            "2) A valid Python implementation of the upgraded algorithm."
+            "1) A concise algorithm description in the required thought field.\n"
+            "2) A valid Python implementation in the required code block."
         )
         messages.append({"role": "system", "content": system_prompt})
 
@@ -523,18 +522,11 @@ Step 1 -- Propose a New Algorithmic Concept
 - Clearly describe the core mechanism of your algorithm.
 - Focus on the fundamental reasoning principle.
 - Keep it concise but precise.
-- Wrap the description EXACTLY inside:
-<concept>
-...
-</concept>
+- Describe the design idea in one concise sentence.
 
 Step 2 — Implement the Algorithm  
-- Implement your proposed algorithm using the exact Python function template provided below:
-```python
-{str(temp_func)}
-```
-- Do NOT modify the function name, arguments, or return type.
-- Place all necessary `import` statements inside the function body.
+- Implement the proposed algorithm using the exact Python function template below.
+{cls._algorithm_output_requirements(temp_func)}
 """
 
         content.append({
@@ -570,8 +562,8 @@ Step 2 — Implement the Algorithm
             "inspiration from the best-performing algorithms discovered by the agent swarm. "
             "You must synthesize these inspirations to push the baseline algorithm past its current performance ceiling.\n\n"
             "You may reason and organize your thoughts freely, but your FINAL OUTPUT must strictly adhere to the following format:\n"
-            "1) A concise summary of your upgraded algorithm concept wrapped EXACTLY inside <concept> and </concept> tags.\n"
-            "2) A valid Python implementation of the algorithm."
+            "1) A concise algorithm description in the required thought field.\n"
+            "2) A valid Python implementation in the required code block."
         )
         messages.append({"role": "system", "content": system_prompt})
 
@@ -634,18 +626,11 @@ Step 1 -- Propose a New Algorithmic Concept
 - Clearly describe the core mechanism of your algorithm.
 - Focus on the fundamental reasoning principle.
 - Keep it concise but precise.
-- Wrap the description EXACTLY inside:
-<concept>
-...
-</concept>
+- Describe the design idea in one concise sentence.
 
 Step 2 — Implement the Algorithm  
-- Implement your proposed algorithm using the exact Python function template provided below:
-```python
-{str(temp_func)}
-```
-- Do NOT modify the function name, arguments, or return type.
-- Place all necessary `import` statements inside the function body.
+- Implement the proposed algorithm using the exact Python function template below.
+{cls._algorithm_output_requirements(temp_func)}
 """
         content.append({
             "type": "text",

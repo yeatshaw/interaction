@@ -29,7 +29,15 @@ import numpy as np
 
 
 def best_program(log_dir: Path) -> tuple[dict, str]:
-    path = log_dir if log_dir.name == "sample_best.json" else log_dir / "sample_best.json"
+    if log_dir.is_file():
+        path = log_dir
+    else:
+        candidates = (
+            log_dir / "sample_best.json",
+            log_dir / "samples" / "samples_best.json",
+        )
+        path = next((candidate for candidate in candidates if candidate.is_file()),
+                    candidates[0])
     records = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(records, dict):
         records = [records]

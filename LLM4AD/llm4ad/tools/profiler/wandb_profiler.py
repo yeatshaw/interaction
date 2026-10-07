@@ -103,6 +103,7 @@ class WandBProfiler(ProfilerBase):
             self._record_and_print_verbose(function, resume_mode=resume_mode)
             self._write_wandb()
             self._write_json(function, program=program)
+            return self._num_samples
         finally:
             self._register_function_lock.release()
 

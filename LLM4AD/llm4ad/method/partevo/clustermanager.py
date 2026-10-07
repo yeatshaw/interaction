@@ -35,7 +35,14 @@ from .clusterunit import ClusterUnit
 from .externalArchive import ExternalArchive
 from llm4ad.base import Function
 from .base import Evoind
-from codebleu import calc_codebleu
+try:
+    from codebleu import calc_codebleu
+except ImportError:  # Keep PartEvo importable when the optional package is absent.
+    def calc_codebleu(references, hypotheses, **kwargs):
+        reference = str(references[0]) if references else ""
+        hypothesis = str(hypotheses[0]) if hypotheses else ""
+        score = 1.0 if reference == hypothesis else 0.0
+        return {"syntax_match_score": score, "dataflow_match_score": score}
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
@@ -377,7 +384,7 @@ class ClusterManager:
 
             # --- Cross-Niches Collaboration ---
             if need_external:
-                if operator == 'cn':    # Crossover with external help
+                if operator in ('cn', 'cc'):    # Crossover with external help
                     other_units = [u for uid, u in self.cluster_units.items() if uid != chosen_c_id and len(u) > 0]
                     helper_func = None
 
@@ -414,7 +421,7 @@ class ClusterManager:
         """
         with self._lock:
             if offspring.score is None:
-                return
+                return False
 
             try:
                 # --- Deduplication & Rejuvenation Logic ---
@@ -433,13 +440,28 @@ class ClusterManager:
                                 f"♻️ [Manager] Replacing existing individual (Score: {existing_func.score:.4f}) with new candidate.")
                             self.population[i] = offspring
                             is_duplicate_or_neutral = True
+                            # A replacement is still a completed offspring.  Keep
+                            # it in next_pop so a generation can finish even when
+                            # the objective has coarse/discrete values.
+                            self.next_pop.append(offspring)
                             break
                         else:
-                            return  # Drop inferior duplicates
+                            # Do not discard a valid evaluated offspring before
+                            # generation survival.  PartEvo must be allowed to
+                            # fill next_pop and let population management decide
+                            # which duplicate survives; otherwise a batch of
+                            # equal/discrete scores can make a whole tree branch
+                            # look incomplete and terminate MCTS early.
+                            self.next_pop.append(offspring)
+                            if len(self.next_pop) >= self.pop_size:
+                                self._manager_pop_management()
+                            return True
 
                 if is_duplicate_or_neutral:
                     self._update_global_best([Evoind(offspring)])
-                    return
+                    if len(self.next_pop) >= self.pop_size:
+                        self._manager_pop_management()
+                    return True
 
                 if self.global_best_ind is None or offspring.score > self.global_best_ind.score:
                     self.global_best_ind = offspring
@@ -452,17 +474,24 @@ class ClusterManager:
                     evo_offspring = Evoind(function=offspring, cluster_id=target_id)
                     if hasattr(offspring, 'reflection'):
                         evo_offspring.set_reflection(offspring.reflection)
-                    self.cluster_units[target_id].register_individual(evo_offspring)
+                    # Niche bookkeeping must not prevent global population
+                    # management and generation completion.
+                    try:
+                        self.cluster_units[target_id].register_individual(evo_offspring)
+                    except Exception as exc:
+                        if self.debug_flag:
+                            print(f"[Manager] Niche registration failed: {exc}")
 
                 self.external_archive.register(offspring)
 
                 if len(self.next_pop) >= self.pop_size:
                     self._manager_pop_management()
+                return True
 
             except Exception as e:
                 print(f"🚨 [Manager] Error in register_offspring: {e}")
                 traceback.print_exc()
-                return
+                return False
 
     def _manager_pop_management(self):
         """

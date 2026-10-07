@@ -81,7 +81,12 @@ def restore_tree(checkpoint):
         nodes[node_id] = RecipeNode(node_id, record["Q"], record["depth"],
                                     visits=record.get("visits", 1),
                                     incoming_recipe_id=record.get("incoming_recipe_id"),
-                                    token_usage=record.get("token_usage"))
+                                    token_usage=record.get("token_usage"),
+                                    stagnation_iteration=record.get(
+                                        "stagnation_iteration", 0),
+                                    best_score=record.get("best_score"),
+                                    score_mean=record.get("score_mean"),
+                                    score_std=record.get("score_std"))
     root = None
     for node_id, record in records.items():
         parent_id = record.get("parent_population_node_id")

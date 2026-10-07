@@ -8,6 +8,7 @@ from llm4ad.task.optimization.online_bin_packing import OBPEvaluation
 from llm4ad.tools.llm.llm_api_https import HttpsApi
 from llm4ad.method.funsearch import FunSearch
 from llm4ad.tools.profiler import ProfilerBase
+from funsearch_config import TREE_REFLECTION_CONFIG
 
 if __name__ == '__main__':
     llm = HttpsApi(host='xxx',  # your host endpoint, e.g., 'api.openai.com', 'api.deepseek.com'
@@ -24,6 +25,7 @@ if __name__ == '__main__':
         max_sample_nums=20,
         num_samplers=1,
         num_evaluators=1,
+        tree_reflection=TREE_REFLECTION_CONFIG,
     )
 
     method.run()

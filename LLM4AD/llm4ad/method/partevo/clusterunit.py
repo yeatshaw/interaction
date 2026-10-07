@@ -31,7 +31,6 @@ from typing import List, Tuple, Literal, Optional, Dict, Any
 from llm4ad.base import Function
 from .base import Evoind
 from threading import RLock
-import itertools
 import random
 
 
@@ -50,6 +49,7 @@ class ClusterUnit:
         're': 'tournament',
         'se': 'tournament',
         'cc': 'tournament',
+        'cn': 'tournament',
         'lge': 'random'
     }
 
@@ -89,7 +89,9 @@ class ClusterUnit:
         self.intra_operators = intra_operators
         # Default requirement: cc needs 1 internal parent (the other is provided externally).
         self.intra_operators_parent_num = intra_operators_parent_num or {'re': 1, 'se': 1, 'cc': 1, 'lge': 1}
-        self._intra_operators_iterator = itertools.cycle(self.intra_operators)
+        # Explicit cursor so a PartEvo branch can be serialized and resumed
+        # without losing its local operator schedule.
+        self._operator_position = 0
 
     def __len__(self):
         with self._lock: return len(self._population)
@@ -179,11 +181,15 @@ class ClusterUnit:
                     mode = 'tournament'
             else:
                 # [Requester Mode]: Evolve locally, cycle through operators
-                current_operator = next(self._intra_operators_iterator)
+                if not self.intra_operators:
+                    return [], None, False
+                current_operator = self.intra_operators[
+                    self._operator_position % len(self.intra_operators)]
+                self._operator_position += 1
                 number = self.intra_operators_parent_num.get(current_operator, 1)
 
                 # Determine if the operator requires external collaboration (e.g., Crossover)
-                if current_operator == 'cc':
+                if current_operator in ('cc', 'cn'):
                     need_external_help = True
                 elif current_operator == 'lge':
                     need_external_help = True

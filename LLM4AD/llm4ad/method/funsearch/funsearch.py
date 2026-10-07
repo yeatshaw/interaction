@@ -26,13 +26,20 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
+import os
 import time
-from threading import Thread
+from threading import RLock, Thread
 import traceback
 from typing import Optional, Literal
 
 from . import programs_database
-from .config import ProgramsDatabaseConfig
+from .config import ProgramsDatabaseConfig, TreeReflectionConfig
+from .tree_reflection import (
+    TreeReflectionManager,
+    augment_funsearch_prompt,
+    build_reflection_prompt,
+)
 from ...base import *
 from .profiler import FunSearchProfiler
 from ...tools.profiler import ProfilerBase
@@ -51,6 +58,8 @@ class FunSearch:
                  resume_mode: bool = False,
                  debug_mode: bool = False,
                  multi_thread_or_process_eval: Literal['thread', 'process'] = 'thread',
+                 tree_reflection: TreeReflectionConfig | dict | None = None,
+                 checkpoint_path: str | None = None,
                  **kwargs):
         """Function Search.
         Args:
@@ -77,6 +86,8 @@ class FunSearch:
         self._samples_per_prompt = samples_per_prompt
         self._debug_mode = debug_mode
         self._resume_mode = resume_mode
+        self._checkpoint_path = checkpoint_path
+        self._tree_reflection_config = TreeReflectionConfig.from_value(tree_reflection)
 
         # function to be evolved
         self._function_to_evolve: Function = TextFunctionProgramConverter.text_to_function(self._template_program_str)
@@ -94,6 +105,30 @@ class FunSearch:
         llm.debug_mode = debug_mode
         self._evaluator = SecureEvaluator(evaluation, debug_mode=debug_mode, **kwargs)
         self._profiler = profiler
+        self._tree_reflection = None
+        self._tree_lock = RLock()
+        if self._tree_reflection_config.enabled:
+            profiler_log_dir = getattr(self._profiler, '_log_dir', None)
+            tree_path = self._tree_reflection_config.tree_path
+            stats_path = self._tree_reflection_config.stats_path
+            experience_path = self._tree_reflection_config.experience_path
+            if profiler_log_dir:
+                tree_path = tree_path or os.path.join(
+                    profiler_log_dir, 'funsearch_tree.json')
+                stats_path = stats_path or os.path.join(
+                    profiler_log_dir, 'tree_reflection_stats.json')
+                experience_path = experience_path or os.path.join(
+                    profiler_log_dir, 'refineevo_experiences.json')
+            self._tree_reflection = TreeReflectionManager(
+                self.db_config.num_islands,
+                self._tree_reflection_config,
+                reflector_llm=llm,
+                tree_path=tree_path,
+                stats_path=stats_path,
+                experience_path=experience_path,
+            )
+            self._database.set_reset_callback(
+                self._tree_reflection.handle_database_reset)
 
         # statistics
         self._tot_sample_nums = 0
@@ -123,13 +158,24 @@ class FunSearch:
             try:
                 # get prompt
                 prompt = self._database.get_prompt()
-                prompt_contents = [prompt.code for _ in range(self._samples_per_prompt)]
+                reflection_context = None
+                prompt_code = prompt.code
+                if self._tree_reflection is not None:
+                    reflection_context = self._tree_reflection.prepare(prompt.island_id)
+                    reflection_prompt = build_reflection_prompt(
+                        reflection_context, self._tree_reflection)
+                    reflection = self._sampler.llm.draw_sample(reflection_prompt)
+                    prompt_code = augment_funsearch_prompt(prompt.code, reflection)
+                prompt_contents = [
+                    prompt_code for _ in range(self._samples_per_prompt)
+                ]
 
                 # do sample
                 draw_sample_start = time.time()
                 sampled_funcs = self._sampler.draw_samples(prompt_contents)
                 draw_sample_times = time.time() - draw_sample_start
-                avg_time_for_each_sample = draw_sample_times / len(sampled_funcs)
+                avg_time_for_each_sample = (
+                    draw_sample_times / len(sampled_funcs) if sampled_funcs else 0.0)
 
                 # convert samples to program instances
                 programs_to_be_eval = []
@@ -158,6 +204,8 @@ class FunSearch:
                     # check if the function has converted to Function instance successfully
                     if function is None:
                         continue
+                    if score is not None:
+                        function.score = score
                     # register to program database
                     if score is not None:
                         self._database.register_function(
@@ -166,13 +214,28 @@ class FunSearch:
                             score=score
                         )
                     # register to profiler
+                    sample_order = None
                     if self._profiler is not None:
                         function.score = score
                         function.sample_time = avg_time_for_each_sample
                         function.evaluate_time = eval_time
-                        self._profiler.register_function(function, program=str(program))
-                        if isinstance(self._profiler, FunSearchProfiler):
-                            self._profiler.register_program_db(self._database)
+                        sample_order = self._profiler.register_function(
+                            function, program=str(program))
+                    if sample_order is None:
+                        sample_order = self._tot_sample_nums
+                    if score is not None and reflection_context is not None:
+                        self._tree_reflection.commit(
+                            reflection_context,
+                            function,
+                            score,
+                            sample_order=sample_order,
+                        )
+                    if isinstance(self._profiler, FunSearchProfiler):
+                        self._profiler.register_program_db(
+                            self._database,
+                            sample_order=sample_order,
+                            tree_reflection=self._tree_reflection,
+                        )
             except KeyboardInterrupt:
                 break
             except Exception as e:
@@ -188,7 +251,9 @@ class FunSearch:
             pass
 
     def run(self):
-        if not self._resume_mode:
+        if self._resume_mode:
+            self.restore_from_checkpoint()
+        else:
             # evaluate the template program, make sure the score of which is not 'None'
             score, eval_time = self._evaluator.evaluate_program_record_time(program=self._template_program)
             if score is None:
@@ -196,6 +261,8 @@ class FunSearch:
 
             # register the template program to the program database
             self._database.register_function(function=self._function_to_evolve, island_id=None, score=score)
+            if self._tree_reflection is not None:
+                self._tree_reflection.initialize(self._function_to_evolve, score)
             if self._profiler:
                 self._function_to_evolve.score = score
                 self._function_to_evolve.evaluate_time = eval_time
@@ -209,7 +276,113 @@ class FunSearch:
         for t in self._sampler_threads:
             t.join()
 
+        if self._tree_reflection is not None:
+            self._tree_reflection.flush(
+                sample_order=getattr(self._profiler, '_num_samples', None),
+                force=True,
+            )
         if self._profiler is not None:
             self._profiler.finish()
 
         self._sampler.llm.close()
+
+    def save_checkpoint(
+            self,
+            *,
+            sample_order: int,
+            database_snapshot: str | None = None,
+            tree_snapshot: str | None = None,
+            stats_snapshot: str | None = None,
+            experience_snapshot: str | None = None,
+            checkpoint_order: int | None = None,
+    ) -> str | None:
+        """Save the restart metadata associated with one database snapshot."""
+        log_dir = getattr(self._profiler, '_log_dir', None)
+        if not log_dir:
+            return None
+        checkpoint_dir = os.path.join(log_dir, 'checkpoints')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        def relative(path: str | None) -> str | None:
+            if not path:
+                return None
+            return os.path.relpath(path, log_dir)
+
+        payload = {
+            'sample_order': int(sample_order),
+            'generated_sample_nums': int(self._tot_sample_nums),
+            'max_sample_nums': self._max_sample_nums,
+            'checkpoint_order': checkpoint_order,
+            'best_so_far': getattr(self._profiler, '_best_so_far', None),
+            'database_snapshot': relative(database_snapshot),
+            'tree_snapshot': relative(tree_snapshot),
+            'stats_snapshot': relative(stats_snapshot),
+            'experience_snapshot': relative(experience_snapshot),
+            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+        }
+        order = int(checkpoint_order or sample_order)
+        path = os.path.join(checkpoint_dir, f'checkpoint_{order:06d}.json')
+        temp_path = path + '.tmp'
+        with open(temp_path, 'w', encoding='utf-8') as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+        latest_path = os.path.join(checkpoint_dir, 'checkpoint_latest.json')
+        latest_temp_path = latest_path + '.tmp'
+        with open(latest_temp_path, 'w', encoding='utf-8') as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2)
+        os.replace(latest_temp_path, latest_path)
+        return path
+
+    def restore_from_checkpoint(self, checkpoint_path: str | None = None) -> None:
+        """Restore database, tree, router, profiler, and sample counters."""
+        log_dir = getattr(self._profiler, '_log_dir', None)
+        checkpoint_path = checkpoint_path or self._checkpoint_path
+        if checkpoint_path is None and log_dir:
+            checkpoint_path = os.path.join(
+                log_dir, 'checkpoints', 'checkpoint_latest.json')
+        if not checkpoint_path or not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(
+                'FunSearch resume requested, but no checkpoint file was found: '
+                f'{checkpoint_path}')
+        with open(checkpoint_path, 'r', encoding='utf-8') as file:
+            checkpoint = json.load(file)
+
+        def absolute(path: str | None) -> str | None:
+            if not path:
+                return None
+            return path if os.path.isabs(path) else os.path.join(log_dir, path)
+
+        database_path = absolute(checkpoint.get('database_snapshot'))
+        if not database_path or not os.path.isfile(database_path):
+            raise FileNotFoundError(
+                f'Program database snapshot is missing: {database_path}')
+        with open(database_path, 'r', encoding='utf-8') as file:
+            database_data = json.load(file)
+        restored_database = programs_database.ProgramsDatabase(
+            self.db_config,
+            self._template_program,
+            self._function_to_evolve_name,
+        )
+        for island_id, island in enumerate(database_data):
+            for cluster in island:
+                score = cluster.get('score')
+                for function_text in cluster.get('functions', []):
+                    function = TextFunctionProgramConverter.text_to_function(
+                        function_text)
+                    if function is not None:
+                        restored_database.register_function(
+                            function, island_id, score)
+        if self._tree_reflection is not None:
+            self._tree_reflection.restore(
+                absolute(checkpoint.get('tree_snapshot')),
+                absolute(checkpoint.get('stats_snapshot')),
+            )
+            restored_database.set_reset_callback(
+                self._tree_reflection.handle_database_reset)
+        self._database = restored_database
+        if isinstance(self._profiler, FunSearchProfiler):
+            self._profiler.restore_progress(checkpoint)
+        self._tot_sample_nums = int(checkpoint.get(
+            'generated_sample_nums',
+            checkpoint.get('sample_order', 0),
+        ))
