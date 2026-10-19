@@ -33,10 +33,11 @@ class RecipeNode:
 
 class RecipeMCTS:
     def __init__(self, recipes, exploration_constant=0.1, max_depth=50,
-                 depth_balance_weight=0.0):
+                 depth_balance_weight=0.0, allow_recipe_repeats=False):
         self.recipes = dict(recipes)
         self.exploration_constant = float(exploration_constant)
         self.max_depth = int(max_depth)
+        self.allow_recipe_repeats = bool(allow_recipe_repeats)
         # Rewards depths that have received fewer visits. This is deliberately
         # separate from UCT's score and child-level exploration terms.
         self.depth_balance_weight = float(depth_balance_weight)
@@ -50,6 +51,9 @@ class RecipeMCTS:
 
     def uct(self, node, q_min=None, q_max=None):
         if node.parent is None:
+            if self.allow_recipe_repeats and node.children:
+                return self.exploration_constant * math.sqrt(
+                    math.log(node.visits + 1.0) / max(node.visits, 1))
             return float("inf")
         siblings = node.parent.children
         q_min = min((x.Q for x in siblings), default=node.Q) if q_min is None else q_min
@@ -69,7 +73,7 @@ class RecipeMCTS:
             node = stack.pop()
             if node.depth >= self.max_depth:
                 continue
-            if len(node.expanded_recipe_ids) < len(self.recipes):
+            if self.allow_recipe_repeats or len(node.expanded_recipe_ids) < len(self.recipes):
                 result.append(node)
             stack.extend(node.children)
         return result
@@ -84,7 +88,7 @@ class RecipeMCTS:
         candidates = self._expandable_nodes()
         if not candidates:
             return self.root
-        if self.depth_balance_weight == 0.0:
+        if self.depth_balance_weight == 0.0 and not self.allow_recipe_repeats:
             # Preserve the original root-to-leaf UCT behavior by default.
             node = self.root
             while node.children and node.depth < self.max_depth:

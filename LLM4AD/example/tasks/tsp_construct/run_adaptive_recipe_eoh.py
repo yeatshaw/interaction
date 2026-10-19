@@ -10,6 +10,9 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
 from example.tasks.adaptive_recipe_eoh_runner import run_task
+from example.tasks.tsp_construct.adaptive_recipe_eoh_config import (
+    ADAPTIVE_RECIPE_EOH_CONFIG,
+)
 from llm4ad.task.optimization.tsp_construct import TSPEvaluation
 from llm4ad.tools.llm.llm_api_https import HttpsApi
 
@@ -49,6 +52,7 @@ def main():
         evaluation=evaluation,
         llm=llm,
         log_dir="logs/adaptive_recipe_eoh_tsp",
+        adaptive_config=ADAPTIVE_RECIPE_EOH_CONFIG,
     )
 
 

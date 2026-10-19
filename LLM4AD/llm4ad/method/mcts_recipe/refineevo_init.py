@@ -229,7 +229,7 @@ def extract_algorithm_and_code(response: str) -> tuple[str, str]:
     return code, algorithm
 
 
-def sample_initial_algorithm(llm, messages, template_program):
+def sample_initial_algorithm(llm, messages, template_program, response_encoder=None):
     """Generate one initial Function using the local RefineEvo init contract.
 
     The prompt assets and parser are local to LLM4AD.  The returned code is
@@ -237,6 +237,7 @@ def sample_initial_algorithm(llm, messages, template_program):
     passed RefineEvo's strict description/code extraction.
     """
     response = llm.draw_sample(messages)
+    embedding = response_encoder(response) if response_encoder else None
     code, algorithm = extract_algorithm_and_code(response)
     # RefineEvo keeps the complete function for its standalone evaluator;
     # LLM4AD's Function object stores only the body, so use the same trimming
@@ -245,4 +246,6 @@ def sample_initial_algorithm(llm, messages, template_program):
     function = SampleTrimmer.sample_to_function(function_body, template_program)
     if function is None:
         raise ValueError("Generated initialization code could not be converted.")
+    function._generation_raw_response = response
+    function._node_embedding = embedding
     return algorithm, function

@@ -15,6 +15,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import csv
 import io
 import json
@@ -44,9 +45,11 @@ def best_program(log_dir: Path) -> tuple[dict, str]:
     if not records:
         raise ValueError(f"No records in {path}")
     record = records[-1]
-    code = record.get("program") or record.get("code")
+    code = (record.get("program") or record.get("code")
+            or record.get("function"))
     if not code:
-        raise ValueError(f"Final record in {path} has no program/code")
+        raise ValueError(
+            f"Final record in {path} has no program/code/function source")
     return record, code
 
 
@@ -61,7 +64,8 @@ def load_function(code: str):
 
 
 def evaluate_best_experiment(task_type, experiment_dir, test_sets,
-                             output=None, max_nodes=0, instance_timeout=1800):
+                             output=None, max_nodes=0, instance_timeout=1800,
+                             workers=0):
     """Evaluate the final best algorithm on one or more independent test sets.
 
     Args:
@@ -75,6 +79,7 @@ def evaluate_best_experiment(task_type, experiment_dir, test_sets,
             are written below ``<experiment_dir>/test_results``.
         max_nodes: Inclusive TSP node-count limit; the default 0 disables it.
         instance_timeout: Maximum seconds allowed for one TSP/CVRP instance.
+        workers: Number of dataset processes; 0 uses one process per dataset.
 
     Returns:
         List of generated CSV paths.
@@ -118,6 +123,7 @@ def evaluate_best_experiment(task_type, experiment_dir, test_sets,
     if not exact_csv:
         output_path.mkdir(parents=True, exist_ok=True)
 
+    jobs = []
     generated = []
     used_names = set()
     for index, data_path in enumerate(test_sets, 1):
@@ -140,9 +146,26 @@ def evaluate_best_experiment(task_type, experiment_dir, test_sets,
             max_nodes=max_nodes,
             instance_timeout=instance_timeout,
         )
-        run(args)
+        jobs.append(args)
         generated.append(csv_path)
+
+    worker_count = min(
+        len(jobs), int(workers) if int(workers) > 0 else len(jobs))
+    if worker_count == 1:
+        _run_dataset(jobs[0])
+    else:
+        print(
+            f"Evaluating {len(jobs)} datasets in parallel with "
+            f"{worker_count} workers",
+            flush=True,
+        )
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(_run_dataset, jobs))
     return generated
+
+
+def _run_dataset(args):
+    run(args)
 
 
 def normalize_tsp_datasets(payload):
@@ -333,9 +356,9 @@ def load_cvrp_dict(path: Path) -> dict:
                 raise ValueError(f"Invalid CVRP shapes for instance {name!r}")
             coords = coords[:, :2]
             delta = coords[:, None, :] - coords[None, :, :]
-            rounded_matrix = np.floor(np.sqrt(np.sum(delta * delta, axis=2)) + 0.5)
+            distance_matrix = np.sqrt(np.sum(delta * delta, axis=2))
             result[str(name)] = (float(capacity), len(coords), coords, demands,
-                                 bks, rounded_matrix)
+                                 bks, distance_matrix)
         return result
 
     """Load cvrp_dict from NPZ, including cross-version object-array pickles."""
@@ -355,7 +378,7 @@ def load_cvrp_dict(path: Path) -> dict:
             capacity, node_count, coords, demands, bks = item[:5]
             coords = np.asarray(coords, dtype=float)
             delta = coords[:, None, :] - coords[None, :, :]
-            matrix = np.floor(np.sqrt(np.sum(delta * delta, axis=2)) + 0.5)
+            matrix = np.sqrt(np.sum(delta * delta, axis=2))
             rounded[name] = (capacity, node_count, coords, demands, bks, matrix)
         else:
             rounded[name] = item
@@ -747,8 +770,13 @@ def run(args):
         with output_path.open("w", newline="", encoding="utf-8-sig") as file:
             csv.DictWriter(file, fieldnames=tsp_fields).writeheader()
 
+        tsp_instance_rows = []
+
         def append_tsp(row):
             rows.append(row)
+            if row.get("instance") != "mean":
+                tsp_instance_rows.append(row)
+                return
             with output_path.open("a", newline="", encoding="utf-8-sig") as file:
                 csv.DictWriter(file, fieldnames=tsp_fields).writerow(row)
 
@@ -757,7 +785,6 @@ def run(args):
             with data_path.open("rb") as file:
                 datasets, has_names = normalize_tsp_datasets(pickle.load(file))
             skipped = []
-            aggregate_rows = []
             recognized_count = 0
             filtered_count = 0
             for name, item in datasets.items():
@@ -785,35 +812,8 @@ def run(args):
                        "optimal_value": optimum,
                        "score": None if cost is None else -cost,
                        "distance": cost, "gap": gap_percent(cost, optimum)}
-                if has_names:
-                    append_tsp(row)
-                else:
-                    aggregate_rows.append(row)
+                append_tsp(row)
                 print(f"Completed {name}: distance={cost}", flush=True)
-            if not has_names and aggregate_rows:
-                feasible = [row for row in aggregate_rows
-                            if row["distance"] is not None]
-                optimum_values = [float(row["optimal_value"])
-                                  for row in aggregate_rows
-                                  if row["optimal_value"] is not None]
-                gaps = [float(row["gap"]) for row in aggregate_rows
-                        if row["gap"] is not None]
-                append_tsp({
-                    "instance": "mean",
-                    "instance_count": len(aggregate_rows),
-                    "feasible_count": len(feasible),
-                    "node_count": float(np.mean(
-                        [row["node_count"] for row in aggregate_rows])),
-                    "edge_weight_type": "",
-                    "optimal_value": (float(np.mean(optimum_values))
-                                      if optimum_values else None),
-                    "score": (float(np.mean([row["score"] for row in feasible]))
-                              if feasible else None),
-                    "distance": (float(np.mean(
-                        [row["distance"] for row in feasible]))
-                                 if feasible else None),
-                    "gap": float(np.mean(gaps)) if gaps else None,
-                })
             if not rows:
                 detail = skipped[:3]
                 raise ValueError(
@@ -840,6 +840,30 @@ def run(args):
                                 "edge_weight_type": typ, "optimal_value": None,
                                 "score": None if cost is None else -cost,
                                 "distance": cost, "gap": None})
+        if tsp_instance_rows:
+            feasible = [row for row in tsp_instance_rows
+                        if row["distance"] is not None]
+            optimum_values = [float(row["optimal_value"])
+                              for row in tsp_instance_rows
+                              if row["optimal_value"] is not None]
+            gaps = [float(row["gap"]) for row in tsp_instance_rows
+                    if row["gap"] is not None]
+            append_tsp({
+                "instance": "mean",
+                "instance_count": len(tsp_instance_rows),
+                "feasible_count": len(feasible),
+                "node_count": float(np.mean(
+                    [row["node_count"] for row in tsp_instance_rows])),
+                "edge_weight_type": "",
+                "optimal_value": (float(np.mean(optimum_values))
+                                  if optimum_values else None),
+                "score": (float(np.mean([row["score"] for row in feasible]))
+                          if feasible else None),
+                "distance": (float(np.mean(
+                    [row["distance"] for row in feasible]))
+                             if feasible else None),
+                "gap": float(np.mean(gaps)) if gaps else None,
+            })
     elif args.task == "cvrp":
         print(f"Loading CVRP dataset: {args.data}", flush=True)
         d = load_cvrp_dict(Path(args.data))
@@ -885,12 +909,7 @@ def run(args):
                 row = ({"instance": name, "gap_percent": None}
                        if has_optimal_values
                        else {"instance": name, "cost": None})
-            if has_optimal_values:
-                rows.append(row)
-                with output_path.open("a", newline="", encoding="utf-8-sig") as file:
-                    csv.DictWriter(file, fieldnames=cvrp_fields).writerow(row)
-            else:
-                cvrp_rows.append(row)
+            cvrp_rows.append(row)
             print(f"Completed {index}/{len(d)}: {name}", flush=True)
         if not has_optimal_values and cvrp_rows:
             costs = [float(row["cost"]) for row in cvrp_rows
@@ -899,6 +918,16 @@ def run(args):
                 "instance_count": len(cvrp_rows),
                 "feasible_count": len(costs),
                 "mean_cost": float(np.mean(costs)) if costs else None,
+            }
+            rows.append(mean_row)
+            with output_path.open("a", newline="", encoding="utf-8-sig") as file:
+                csv.DictWriter(file, fieldnames=cvrp_fields).writerow(mean_row)
+        elif has_optimal_values and cvrp_rows:
+            gaps = [float(row["gap_percent"]) for row in cvrp_rows
+                    if row.get("gap_percent") is not None]
+            mean_row = {
+                "instance": "mean",
+                "gap_percent": float(np.mean(gaps)) if gaps else None,
             }
             rows.append(mean_row)
             with output_path.open("a", newline="", encoding="utf-8-sig") as file:
@@ -1043,9 +1072,24 @@ def run(args):
                 print(f"VRPTW instance {p.name!r} failed: {exc}", flush=True)
                 row = {"instance": p.stem, "vehicles": None, "distance": None}
             rows.append(row)
-            with output_path.open("a", newline="", encoding="utf-8-sig") as file:
-                csv.DictWriter(file, fieldnames=vrptw_fields).writerow(row)
             print(f"Completed {index}/{len(files)}: {p.stem}", flush=True)
+        if rows:
+            instance_rows = [row for row in rows if row.get("instance") != "mean"]
+            feasible = [row for row in instance_rows
+                        if row["vehicles"] is not None
+                        and row["distance"] is not None]
+            mean_row = {
+                "instance": "mean",
+                "vehicles": (float(np.mean(
+                    [row["vehicles"] for row in feasible]))
+                             if feasible else None),
+                "distance": (float(np.mean(
+                    [row["distance"] for row in feasible]))
+                             if feasible else None),
+            }
+            rows.append(mean_row)
+            with output_path.open("a", newline="", encoding="utf-8-sig") as file:
+                csv.DictWriter(file, fieldnames=vrptw_fields).writerow(mean_row)
         print(f"completed={len(rows)} output={output_path}", flush=True)
         if skipped_instances:
             print("skipped_instances=" + ",".join(skipped_instances), flush=True)
@@ -1061,12 +1105,12 @@ def run(args):
 
 
 if __name__ == "__main__":
-    p=argparse.ArgumentParser(); p.add_argument("--task",choices=("tsp","cvrp","vrptw","bp_1d","kp"),required=True); p.add_argument("--logs",required=True); p.add_argument("--data",nargs="+",required=True); p.add_argument("--output",help="CSV path for one test set, or output directory for multiple sets"); p.add_argument("--max-nodes",type=int,default=0,help="TSP maximum node count, inclusive; 0 means no limit"); p.add_argument("--instance-timeout",type=int,default=1800,help="Per-instance timeout in seconds for TSP/CVRP/BP_1D/KP; 0 disables it");
+    p=argparse.ArgumentParser(); p.add_argument("--task",choices=("tsp","cvrp","vrptw","bp_1d","kp"),required=True); p.add_argument("--logs",required=True); p.add_argument("--data",nargs="+",required=True); p.add_argument("--output",help="CSV path for one test set, or output directory for multiple sets"); p.add_argument("--max-nodes",type=int,default=0,help="TSP maximum node count, inclusive; 0 means no limit"); p.add_argument("--instance-timeout",type=int,default=1800,help="Per-instance timeout in seconds for TSP/CVRP/BP_1D/KP; 0 disables it"); p.add_argument("--workers",type=int,default=0,help="Parallel dataset processes; 0 uses one worker per dataset");
     try:
         args = p.parse_args()
         evaluate_best_experiment(
             args.task, args.logs, args.data, args.output, args.max_nodes,
-            args.instance_timeout)
+            args.instance_timeout, args.workers)
     except Exception:
         traceback.print_exc()
         raise

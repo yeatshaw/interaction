@@ -31,7 +31,16 @@ MCTS_PARTEVO_RECIPE_CONFIG = {
         "bert_model_path": None,
         "seed": None,
         "debug": False,
-        "adaptive": {"enabled": False},
+        "adaptive": {
+            "enabled": False,
+            "strategy": "linear_thompson_sampling",
+            "recipes_per_expansion": 3,
+            "prior_precision": 1.0,
+            "posterior_scale": 0.5,
+            "discount_factor": 0.9,
+            "window_size": 50,
+            "exploration": 1.0,
+        },
     },
     "llm": {
         "host": "api.apilio.ai",

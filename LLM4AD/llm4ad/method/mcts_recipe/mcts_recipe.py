@@ -12,7 +12,7 @@ import threading
 from dataclasses import dataclass
 
 from .budget import SampleBudgetExhausted
-from .adaptive_router import ContextualThompsonRouter
+from ..recipe_selection import create_recipe_selector
 from .mcts import RecipeMCTS, RecipeNode
 from .population import RecipePopulation
 from .persistence import RecipeStore
@@ -51,7 +51,8 @@ class MCTSRecipe:
                  depth_balance_weight=0.0,
                  node_batch_size=100, store_dir="recipe_mcts",
                  expand_fn=None, seed=None, max_sample_count=None,
-                 elite_pool_size=0, adaptive_config=None):
+                 elite_pool_size=0, adaptive_config=None,
+                 node_embedding_model=None, node_embedding_config=None):
         recipes = validate_recipes(recipes)
         self.recipes = {
             k: (v if isinstance(v, RecipeConfig) else RecipeConfig(k, dict(v)))
@@ -66,8 +67,29 @@ class MCTSRecipe:
             raise ValueError("elite_pool_size must be >= 0")
         self.use_elite_pool = self.elite_pool_size > 0
         self.adaptive_config = dict(adaptive_config or {})
+        self.node_embedding_config = dict(node_embedding_config or {})
+        self.node_embedding = None
+        if self.node_embedding_config.get("enabled", False):
+            self.node_embedding_config.setdefault("selection", "individual_single_vote")
+            if self.node_embedding_config["selection"] not in {"individual_single_vote", "population_mean"}:
+                raise ValueError("Unknown node embedding selection mode")
+            from .node_embedding import NodeEmbedding
+            if node_embedding_model is None:
+                raise ValueError("node_embedding_model is required when enabled")
+            self.node_embedding = NodeEmbedding(
+                node_embedding_model, self.node_embedding_config["dimensions"])
+            self.adaptive_config["context_dim"] = self.node_embedding.dimensions
         self.adaptive_enabled = bool(
             self.adaptive_config.get("enabled", False))
+        self.individual_voting = (
+            self.node_embedding is not None
+            and self.node_embedding_config["selection"] == "individual_single_vote")
+        self.allow_recipe_repeats = bool(
+            self.adaptive_config.get("allow_recipe_repeats", False))
+        if (self.individual_voting and self.adaptive_enabled
+                and self.adaptive_config.get("strategy", "linear_thompson_sampling")
+                != "linear_thompson_sampling"):
+            raise ValueError("Individual voting requires linear_thompson_sampling")
         self.adaptive_recipe_count = int(
             self.adaptive_config.get("recipes_per_expansion", 3))
         if self.adaptive_recipe_count < 1:
@@ -78,19 +100,15 @@ class MCTSRecipe:
             self.adaptive_config.get("reward_mean_weight", 0.2))
         self.adaptive_router = None
         if self.adaptive_enabled:
-            self.adaptive_router = ContextualThompsonRouter(
-                self.recipes.keys(),
-                prior_precision=float(
-                    self.adaptive_config.get("prior_precision", 1.0)),
-                posterior_scale=float(
-                    self.adaptive_config.get("posterior_scale", 0.5)),
-            )
+            self.adaptive_router = create_recipe_selector(
+                self.recipes.keys(), self.adaptive_config)
         # UNCERTAIN: the exact recipe definitions and EoH integration callback
         # are deliberately supplied by the task runner, not hard-coded here.
         self.depth_balance_weight = float(depth_balance_weight)
         self.tree = RecipeMCTS(
             self.recipes, exploration_constant, max_depth,
-            depth_balance_weight=self.depth_balance_weight)
+            depth_balance_weight=self.depth_balance_weight,
+            allow_recipe_repeats=self.allow_recipe_repeats)
         self.store = RecipeStore(store_dir, node_batch_size)
         # All recipe-MCTS variants share the disk-backed tree index. The
         # selected node's population snapshot is loaded only when expanded.
@@ -405,6 +423,7 @@ class MCTSRecipe:
                     "evaluate_time": getattr(individual, "evaluate_time", None),
                     "sample_time": getattr(individual, "sample_time", None),
                     "token_usage": getattr(individual, "_recipe_token_usage", None),
+                    "embedding": getattr(individual, "_node_embedding", None),
                 }
                 self._best_samples.append(best_record)
                 self.store.write_best_samples(self._best_samples)
@@ -414,10 +433,16 @@ class MCTSRecipe:
         if token_usage is None:
             token_usage = getattr(node, "token_usage", None)
         self._accumulate_token_usage(token_usage)
+        embedding = None
+        if self.node_embedding is not None:
+            embedding = self.node_embedding.encode_population(population)
         flushed = self.store.add(
             node.population_node_id, node.parent_population_node_id,
             node.depth, recipe_id, population.generation, population,
-            experiences, token_usage=token_usage)
+            experiences, token_usage=token_usage,
+            extra={"embedding": embedding,
+                   "node_embedding_config": self.node_embedding_config,
+                   "recipe_selection": getattr(node, "recipe_selection", None)})
         if flushed is not None:
             if self._disk_tree_mode:
                 self._tree_checkpoint_pending = True
@@ -445,6 +470,7 @@ class MCTSRecipe:
         self._attach_parent_functions(functions)
         population = RecipePopulation(functions, self.pop_size,
                                       record.get("generation", 0))
+        population._node_embedding = record.get("embedding")
         return population, list(record.get("experiences", []))
 
     @staticmethod
@@ -458,6 +484,11 @@ class MCTSRecipe:
         return float(np.max(scores)), float(np.mean(scores)), float(np.std(scores))
 
     def _adaptive_state(self, node, population):
+        if self.node_embedding is not None:
+            embedding = getattr(population, "_node_embedding", None)
+            if embedding is None:
+                raise ValueError("Selected node has no saved embedding; start a new run")
+            return self.node_embedding.validate(embedding).tolist()
         best, mean, std = self._population_stats(population)
         return [
             float(node.depth),
@@ -466,6 +497,11 @@ class MCTSRecipe:
             mean,
             std,
         ]
+
+    def _individual_contexts(self, population):
+        return [self.node_embedding.validate(
+            getattr(function, "_node_embedding", None)).tolist()
+                for function in population.individuals]
 
     def _adaptive_reward(self, parent_population, child_population):
         parent_best, parent_mean, _ = self._population_stats(parent_population)
@@ -489,22 +525,35 @@ class MCTSRecipe:
         pending_recipes = [
             (recipe_id, recipe)
             for recipe_id, recipe in self.recipes.items()
-            if recipe_id not in node.expanded_recipe_ids
+            if self.allow_recipe_repeats or recipe_id not in node.expanded_recipe_ids
         ]
         if not pending_recipes:
             raise RuntimeError(
                 f"Population node {node.population_node_id} is already fully expanded")
         adaptive_state = None
         sampled_recipe_values = {}
+        individual_contexts = None
+        selection_record = None
         if self.adaptive_enabled:
-            adaptive_state = self._adaptive_state(node, population)
-            selected_ids, sampled_recipe_values = (
-                self.adaptive_router.select_top_k(
+            if self.individual_voting:
+                individual_contexts = self._individual_contexts(population)
+                selected_ids, selection_record = self.adaptive_router.select_population_top_k(
+                    individual_contexts,
+                    [recipe_id for recipe_id, _ in pending_recipes],
+                    k=self.adaptive_recipe_count,
+                )
+                selection_record["selected_ids"] = list(selected_ids)
+                selection_record["parent_algorithm_ids"] = [
+                    getattr(function, "_recipe_algorithm_id", None)
+                    for function in population.individuals]
+                sampled_recipe_values = selection_record["vote_counts"]
+            else:
+                adaptive_state = self._adaptive_state(node, population)
+                selected_ids, sampled_recipe_values = self.adaptive_router.select_top_k(
                     adaptive_state,
                     [recipe_id for recipe_id, _ in pending_recipes],
                     k=self.adaptive_recipe_count,
                 )
-            )
             selected_set = set(selected_ids)
             pending_recipes = [
                 (recipe_id, recipe)
@@ -513,7 +562,7 @@ class MCTSRecipe:
             ]
             print(
                 f"Adaptive recipe selection node={node.population_node_id} "
-                f"state={adaptive_state} selected="
+                f"votes_or_scores={sampled_recipe_values} selected="
                 f"{[recipe_id for recipe_id, _ in pending_recipes]}",
                 flush=True,
             )
@@ -601,8 +650,13 @@ class MCTSRecipe:
                 if self.adaptive_enabled:
                     reward = self._adaptive_reward(
                         population, child_population)
-                    self.adaptive_router.update(
-                        recipe_id, adaptive_state, reward)
+                    if self.individual_voting:
+                        self.adaptive_router.update_population(
+                            recipe_id, individual_contexts, reward)
+                    else:
+                        self.adaptive_router.update(
+                            recipe_id, adaptive_state, reward)
+                child.recipe_selection = selection_record
                 self._write_node(child, child_population, recipe_id,
                                  branch_experiences, node_token_usage)
                 elite_text = (f" elite_pool={len(self._elite_pool)}/"
@@ -756,7 +810,7 @@ class MCTSRecipe:
             if int(item.get("depth", 0)) >= self.max_depth:
                 continue
             expanded = set(item.get("expanded_recipe_ids", []))
-            if len(expanded) < recipe_count:
+            if self.allow_recipe_repeats or len(expanded) < recipe_count:
                 candidates.append(item)
         if not candidates:
             return None
@@ -777,7 +831,7 @@ class MCTSRecipe:
             return exploit + self.tree.exploration_constant * math.sqrt(
                 math.log(parent_visits + 1.0) / visits)
 
-        if self.depth_balance_weight == 0.0:
+        if self.depth_balance_weight == 0.0 and not self.allow_recipe_repeats:
             current = records[root_id]
             while children.get(int(current["population_node_id"]), []):
                 current_children = children[int(current["population_node_id"])]
@@ -804,7 +858,12 @@ class MCTSRecipe:
                 candidates,
                 key=lambda item: (
                     uct(item, children.get(int(item["parent_population_node_id"]), []))
-                    if item.get("parent_population_node_id") is not None else float("inf")
+                    if item.get("parent_population_node_id") is not None else
+                    (self.tree.exploration_constant * math.sqrt(
+                        math.log(float(item.get("visits", 1)) + 1.0)
+                        / max(float(item.get("visits", 1)), 1.0))
+                     if self.allow_recipe_repeats and children.get(root_id)
+                     else float("inf"))
                 ) + self.depth_balance_weight * (
                     (max_count - depth_counts.get(int(item.get("depth", 0)), 0))
                     / (max_count + 1.0)
@@ -900,6 +959,9 @@ class MCTSRecipe:
         """Restore tree metadata and RNG state for continued training."""
         from .resume import load_checkpoint, restore_tree
         state = load_checkpoint(checkpoint)
+        if state.get("node_embedding_config", {}) != self.node_embedding_config:
+            raise ValueError(
+                "Node embedding configuration differs from checkpoint; start a new run")
         restored_recipes = validate_recipes(state["recipes"])
         missing_expanders = set(restored_recipes).difference(
             self.expand_fn if isinstance(self.expand_fn, dict) else restored_recipes)
@@ -933,22 +995,31 @@ class MCTSRecipe:
                             if self.use_elite_pool else [])
         adaptive_state = state.get("adaptive")
         if isinstance(adaptive_state, dict):
+            if bool(adaptive_state.get("allow_recipe_repeats", False)) != self.allow_recipe_repeats:
+                raise ValueError("allow_recipe_repeats differs from checkpoint; start a new run")
             self.adaptive_enabled = bool(
                 adaptive_state.get("enabled", self.adaptive_enabled))
             self.adaptive_recipe_count = int(
                 adaptive_state.get("recipes_per_expansion",
                                    self.adaptive_recipe_count))
-            if self.adaptive_enabled and self.adaptive_router is None:
-                self.adaptive_router = ContextualThompsonRouter(
-                    self.recipes.keys(),
-                    prior_precision=float(adaptive_state.get(
-                        "prior_precision", 1.0)),
-                    posterior_scale=float(adaptive_state.get(
-                        "posterior_scale", 0.5)),
-                )
+            selector_state = adaptive_state.get(
+                "selector", adaptive_state.get("router", {})) or {}
+            checkpoint_strategy = selector_state.get("strategy")
+            if self.adaptive_enabled and checkpoint_strategy:
+                selector_config = dict(self.adaptive_config)
+                selector_config.update({
+                    key: selector_state[key]
+                    for key in ("strategy", "prior_precision", "posterior_scale",
+                                "discount_factor", "window_size", "exploration")
+                    if key in selector_state
+                })
+                self.adaptive_router = create_recipe_selector(
+                    self.recipes.keys(), selector_config)
+            elif self.adaptive_enabled and self.adaptive_router is None:
+                self.adaptive_router = create_recipe_selector(
+                    self.recipes.keys(), self.adaptive_config)
             if self.adaptive_router is not None:
-                self.adaptive_router.load_state_dict(
-                    adaptive_state.get("router", {}))
+                self.adaptive_router.load_state_dict(selector_state)
         if self._disk_tree_mode:
             tree_state = self.store.load_tree_state()
             if tree_state.get("root_id") is None and state.get("nodes"):
@@ -1026,6 +1097,7 @@ class MCTSRecipe:
             "next_algorithm_id": self._next_algorithm_id,
             "total_sample_count": self._total_sample_count,
             "max_sample_count": self.max_sample_count,
+            "node_embedding_config": self.node_embedding_config,
             "best_score": self._best_score,
             "max_depth": self.max_depth,
             "pop_size": self.pop_size,
@@ -1044,13 +1116,18 @@ class MCTSRecipe:
             "adaptive": {
                 "enabled": self.adaptive_enabled,
                 "recipes_per_expansion": self.adaptive_recipe_count,
+                "allow_recipe_repeats": self.allow_recipe_repeats,
+                "strategy": (self.adaptive_router.strategy
+                             if self.adaptive_router is not None else
+                             self.adaptive_config.get(
+                                 "strategy", "linear_thompson_sampling")),
                 "prior_precision": (
                     self.adaptive_router.prior_precision
                     if self.adaptive_router is not None else None),
                 "posterior_scale": (
                     self.adaptive_router.posterior_scale
                     if self.adaptive_router is not None else None),
-                "router": (
+                "selector": (
                     self.adaptive_router.state_dict()
                     if self.adaptive_router is not None else None),
             },

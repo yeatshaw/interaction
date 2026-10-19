@@ -55,6 +55,8 @@ def function_from_record(record, template_program=None):
     function._recipe_token_usage = record.get("token_usage")
     function._recipe_sample_order = record.get("sample_order")
     function._recipe_id = record.get("recipe_id")
+    function._generation_raw_response = record.get("generation_raw_response")
+    function._node_embedding = record.get("embedding")
     return function
 
 

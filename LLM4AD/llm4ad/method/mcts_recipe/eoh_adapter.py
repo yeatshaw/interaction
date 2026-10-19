@@ -13,6 +13,7 @@ from ..eoh.prompt import EoHPrompt
 from ..eoh.sampler import EoHSampler
 from ...base import TextFunctionProgramConverter, SecureEvaluator
 from .budget import SampleBudgetExhausted
+from .node_embedding import NodeEmbeddingError
 
 
 class EoHRecipeExpander:
@@ -24,10 +25,10 @@ class EoHRecipeExpander:
 
     def __init__(self, llm, evaluation, info, template_program,
                  num_samplers=10, num_evaluators=1, debug_mode=False,
-                 operators=None, **evaluator_kwargs):
+                 operators=None, response_encoder=None, **evaluator_kwargs):
         self.info = dict(info)
         self.template_program = template_program
-        self.sampler = EoHSampler(llm, template_program)
+        self.sampler = EoHSampler(llm, template_program, response_encoder=response_encoder)
         self.evaluator = SecureEvaluator(evaluation, debug_mode=debug_mode,
                                          **evaluator_kwargs)
         self.num_samplers = max(1, int(num_samplers))
@@ -201,6 +202,8 @@ class EoHRecipeExpander:
                 function, self.template_program)
             if program is None:
                 return None
+        except NodeEmbeddingError:
+            raise
         except Exception as exc:
             if self.debug_mode:
                 print(f"DEBUG: candidate generation failed: {exc}")
@@ -250,6 +253,8 @@ class EoHRecipeExpander:
                     score, eval_time = None, None
                 else:
                     score, eval_time = result
+            except NodeEmbeddingError:
+                raise
             except Exception as exc:
                 if self.debug_mode:
                     print(f"DEBUG: candidate evaluation failed: {exc}")
@@ -265,6 +270,8 @@ class EoHRecipeExpander:
             if on_evaluated is not None:
                 try:
                     on_evaluated(function)
+                except NodeEmbeddingError:
+                    raise
                 except Exception as exc:
                     if self.debug_mode:
                         print(f"DEBUG: sample-best registration failed: {exc}")
@@ -342,6 +349,8 @@ class EoHRecipeExpander:
             try:
                 count = selection_num if operator in ("e1", "e2") else 1
                 refs = copy.deepcopy(population.select_many(count))
+            except NodeEmbeddingError:
+                raise
             except Exception as exc:
                 if self.debug_mode:
                     print(f"DEBUG: reference selection failed: {exc}")
@@ -394,6 +403,8 @@ class EoHRecipeExpander:
                          "refs": refs, "operator": operator}
             evaluated = self._evaluate_candidates([candidate])
             return evaluated[0]["function"] if evaluated else None
+        except NodeEmbeddingError:
+            raise
         except Exception as exc:
             if self.debug_mode:
                 print(f"DEBUG: candidate generation failed: {exc}")
@@ -427,6 +438,8 @@ class NoReflectionEoHRecipeExpander(EoHRecipeExpander):
                 function, self.template_program)
             if program is None:
                 return None
+        except NodeEmbeddingError:
+            raise
         except Exception as exc:
             if self.debug_mode:
                 print(f"DEBUG: candidate generation failed: {exc}")
@@ -536,6 +549,8 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
                 function, self.template_program)
             if program is None:
                 return None
+        except NodeEmbeddingError:
+            raise
         except Exception as exc:
             if self.debug_mode:
                 print(f"DEBUG: RefineEvo candidate generation failed: {exc}")
@@ -605,6 +620,8 @@ class RefineEvoRecipeExpander(EoHRecipeExpander):
                 try:
                     count = selection_num if operator in ("e1", "e2") else 1
                     refs = copy.deepcopy(population.select_many(count))
+                except NodeEmbeddingError:
+                    raise
                 except Exception as exc:
                     if self.debug_mode:
                         print(f"DEBUG: reference selection failed: {exc}")

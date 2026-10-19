@@ -19,7 +19,8 @@ def _int_env(name, default):
     return int(os.environ.get(name, str(default)))
 
 
-def run_task(*, method_name, template_module, evaluation, llm, log_dir):
+def run_task(*, method_name, template_module, evaluation, llm, log_dir,
+             adaptive_config=None):
     info = get_info(method_name, template_module)
     log_dir = Path(os.environ.get("LLM4AD_LOG_DIR", log_dir)).resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -50,6 +51,7 @@ def run_task(*, method_name, template_module, evaluation, llm, log_dir):
         profiler=profiler,
         info=info,
         recipe_configs=recipes,
+        adaptive_config=adaptive_config,
         recipe_temperature=float(os.environ.get(
             "LLM4AD_RECIPE_TEMPERATURE", "1.0")),
         refineevo_manager=experience_manager,

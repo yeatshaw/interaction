@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import math
+import time
 from numbers import Integral
 from typing import Any
 
@@ -11,12 +13,14 @@ __all__ = ["ScheduleInitEvaluation"]
 
 
 class ScheduleInitEvaluation(Evaluation):
-    """Evaluate initial circular-grid layouts using the PDF uniformity score."""
+    """Evaluate initial circular-grid layouts and optionally their runtime."""
 
     UNIFORMITY_WEIGHT = 0.55
+    SPEED_WEIGHT = 0.10
 
     def __init__(self, timeout_seconds=20, n_instances=32, seed=2024,
-                 instances=None, **kwargs):
+                 instances=None, tfast_seconds=None, tslow_seconds=None,
+                 **kwargs):
         super().__init__(
             template_program=template_program,
             task_description=task_description,
@@ -31,6 +35,19 @@ class ScheduleInitEvaluation(Evaluation):
         else:
             self._instances = self._normalize_instances(instances)
         self.n_instances = len(self._instances)
+        if (tfast_seconds is None) != (tslow_seconds is None):
+            raise ValueError(
+                "tfast_seconds and tslow_seconds must be provided together.")
+        if tfast_seconds is not None:
+            if tfast_seconds <= 0 or tslow_seconds <= tfast_seconds:
+                raise ValueError(
+                    "Require 0 < tfast_seconds < tslow_seconds.")
+            self.tfast_seconds = float(tfast_seconds)
+            self.tslow_seconds = float(tslow_seconds)
+        else:
+            self.tfast_seconds = None
+            self.tslow_seconds = None
+        self.last_metrics = None
 
     @staticmethod
     def _normalize_instance(instance, index):
@@ -181,14 +198,45 @@ class ScheduleInitEvaluation(Evaluation):
         if not callable(initializer):
             return None
         uniformity_scores = []
+        elapsed_seconds = 0.0
         for n, services in self._instances:
+            call_start = time.perf_counter()
             try:
                 grid = initializer(n, list(services))
             except Exception:
+                self.last_metrics = None
                 return None
+            elapsed_seconds += time.perf_counter() - call_start
             uniformity = self.score_grid(grid, n, services)
             if uniformity is None:
+                self.last_metrics = None
                 return None
             uniformity_scores.append(uniformity)
         mean_uniformity = sum(uniformity_scores) / len(uniformity_scores)
-        return self.UNIFORMITY_WEIGHT * mean_uniformity
+        speed_score = self._speed_score(elapsed_seconds)
+        score = self.UNIFORMITY_WEIGHT * mean_uniformity
+        if speed_score is not None:
+            score += self.SPEED_WEIGHT * speed_score
+        self.last_metrics = {
+            "mean_uniformity": mean_uniformity,
+            "elapsed_seconds": elapsed_seconds,
+            "speed_score": speed_score,
+            "uniformity_contribution": self.UNIFORMITY_WEIGHT * mean_uniformity,
+            "speed_contribution": (
+                self.SPEED_WEIGHT * speed_score
+                if speed_score is not None else None
+            ),
+            "fitness": score,
+        }
+        return score
+
+    def _speed_score(self, elapsed_seconds):
+        """Apply the PDF speed formula when grader reference times are known."""
+        if self.tfast_seconds is None:
+            return None
+        if elapsed_seconds <= self.tfast_seconds:
+            return 1.0
+        if elapsed_seconds >= self.tslow_seconds:
+            return 0.0
+        denominator = math.log(self.tslow_seconds / self.tfast_seconds)
+        return 1.0 - math.log(elapsed_seconds / self.tfast_seconds) / denominator

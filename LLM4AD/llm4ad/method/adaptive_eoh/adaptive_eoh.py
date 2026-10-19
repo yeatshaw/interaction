@@ -13,6 +13,7 @@ from ..eoh.profiler import EoHProfiler
 from ..eoh.prompt import EoHPrompt
 from ...base import Function, TextFunctionProgramConverter
 from ...method.mcts_recipe.recipes import get_default_recipes
+from ...method.recipe_selection import create_recipe_selector
 
 
 class AdaptiveRecipeEoH(EoH):
@@ -28,7 +29,7 @@ class AdaptiveRecipeEoH(EoH):
 
     def __init__(self, *args, recipe_configs=None, recipe_temperature=1.0,
                  recipe_reflectors=None, refineevo_manager=None,
-                 recipe_stats_path=None, **kwargs):
+                 recipe_stats_path=None, adaptive_config=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._recipe_configs = recipe_configs or get_default_recipes()
         if not self._recipe_configs:
@@ -61,6 +62,12 @@ class AdaptiveRecipeEoH(EoH):
         self._recipe_local = threading.local()
         self._recipe_gain = {name: 0.0 for name in self._recipe_configs}
         self._recipe_count = Counter()
+        self._adaptive_config = dict(adaptive_config or {})
+        self._adaptive_enabled = bool(
+            self._adaptive_config.get("enabled", False))
+        self._recipe_selector = (
+            create_recipe_selector(self._recipe_configs, self._adaptive_config)
+            if self._adaptive_enabled else None)
         self._recipe_stats_path = recipe_stats_path
         if self._recipe_stats_path is None and self._profiler is not None:
             self._recipe_stats_path = os.path.join(
@@ -68,6 +75,16 @@ class AdaptiveRecipeEoH(EoH):
         if self._recipe_stats_path:
             os.makedirs(os.path.dirname(os.path.abspath(self._recipe_stats_path)),
                         exist_ok=True)
+            if self._recipe_selector is not None:
+                try:
+                    with open(self._recipe_stats_path, encoding="utf-8") as file:
+                        saved = json.load(file)
+                    self._recipe_gain.update(saved.get("cumulative_gain", {}))
+                    self._recipe_count.update(saved.get("selection_count", {}))
+                    self._recipe_selector.load_state_dict(
+                        saved.get("selector", {}))
+                except (FileNotFoundError, json.JSONDecodeError):
+                    pass
 
     def _recipe_probabilities(self):
         with self._recipe_lock:
@@ -138,9 +155,25 @@ class AdaptiveRecipeEoH(EoH):
         ]
 
     def _select_recipe(self):
+        if self._recipe_selector is not None:
+            state = self._recipe_context()
+            selected, _ = self._recipe_selector.select_top_k(
+                state, self._recipe_configs, k=1)
+            recipe_id = selected[0]
+            return recipe_id, 1.0, state
         names, probabilities = self._recipe_probabilities()
         recipe_id = random.choices(names, weights=probabilities, k=1)[0]
-        return recipe_id, probabilities[names.index(recipe_id)]
+        return recipe_id, probabilities[names.index(recipe_id)], None
+
+    def _recipe_context(self):
+        scores = [float(item.score) for item in self._population.population
+                  if getattr(item, "score", None) is not None]
+        if not scores:
+            scores = [0.0]
+        return [float(self._population.generation), 0.0, max(scores),
+                sum(scores) / len(scores),
+                (sum((value - sum(scores) / len(scores)) ** 2
+                     for value in scores) / len(scores)) ** 0.5]
 
     def _recipe_reflection(self, refs, recipe_id, operator):
         config = self._recipe_configs[recipe_id]
@@ -185,8 +218,7 @@ class AdaptiveRecipeEoH(EoH):
         with self._recipe_lock:
             selected = self._generation_recipes.get(generation)
             if selected is None:
-                recipe_id, probability = self._select_recipe()
-                selected = (recipe_id, probability)
+                selected = self._select_recipe()
                 self._generation_recipes[generation] = selected
             return selected
 
@@ -200,7 +232,7 @@ class AdaptiveRecipeEoH(EoH):
             return
         if generation is None:
             generation = self._population.generation
-        recipe_id, probability = self._generation_recipe(generation)
+        recipe_id, probability, adaptive_state = self._generation_recipe(generation)
         recipe_state = None
         try:
             reflection = self._recipe_reflection(refs, recipe_id, operator)
@@ -218,6 +250,7 @@ class AdaptiveRecipeEoH(EoH):
         self._recipe_local.context = {
             "recipe_id": recipe_id,
             "probability": probability,
+            "adaptive_state": adaptive_state,
             "suggestion": suggestion,
             "baseline": baseline,
             "recipe_state": recipe_state,
@@ -232,6 +265,9 @@ class AdaptiveRecipeEoH(EoH):
         with self._recipe_lock:
             self._recipe_gain[recipe_id] += gain
             self._recipe_count[recipe_id] += 1
+            if self._recipe_selector is not None:
+                self._recipe_selector.update(
+                    recipe_id, context.get("adaptive_state"), gain)
             payload = {
                 "cumulative_gain": dict(self._recipe_gain),
                 "selection_count": dict(self._recipe_count),
@@ -240,6 +276,8 @@ class AdaptiveRecipeEoH(EoH):
                            if self._recipe_count[name] else 0.0)
                     for name in self._recipe_configs
                 },
+                "selector": (self._recipe_selector.state_dict()
+                             if self._recipe_selector is not None else None),
             }
             if self._recipe_stats_path:
                 temp = self._recipe_stats_path + ".tmp"

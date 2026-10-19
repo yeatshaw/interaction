@@ -9,6 +9,7 @@ import math
 import json
 import threading
 import urllib.request
+import urllib.error
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from llm4ad.method.mcts_recipe import (
     get_default_recipes,
 )
 from llm4ad.method.mcts_recipe.budget import SampleBudgetExhausted
+from llm4ad.method.mcts_recipe.node_embedding import NodeEmbedding, NodeEmbeddingError
 from llm4ad.method.mcts_recipe.refineevo_init import (
     initial_messages,
     sample_initial_algorithm,
@@ -35,30 +37,80 @@ from llm4ad.method.mcts_recipe.refineevo_init import (
 class OpenAIEmbedding:
     """Small OpenAI-compatible embedding adapter used by RefineEvo."""
 
-    def __init__(self, api_key, base_url, model, encoding_format="float"):
+    def __init__(self, api_key, base_url, model, encoding_format="float",
+                 dimensions=None, max_retries=4, retry_backoff_seconds=1.0,
+                 timeout_seconds=60, max_concurrent_requests=2):
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.encoding_format = encoding_format
+        self.dimensions = None if dimensions is None else int(dimensions)
+        if self.dimensions is not None and self.dimensions < 1:
+            raise ValueError("embedding dimensions must be positive")
+        self.max_retries = int(max_retries)
+        self.retry_backoff_seconds = float(retry_backoff_seconds)
+        self.timeout_seconds = float(timeout_seconds)
+        concurrent_requests = int(max_concurrent_requests)
+        if (self.max_retries < 0 or concurrent_requests < 1
+                or not math.isfinite(self.retry_backoff_seconds)
+                or self.retry_backoff_seconds < 0
+                or not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0):
+            raise ValueError("Invalid embedding retry, timeout or concurrency settings")
+        self._request_slots = threading.BoundedSemaphore(concurrent_requests)
+
+    def _request(self, request):
+        """Retry transient failures without regenerating the LLM response."""
+        for attempt in range(self.max_retries + 1):
+            retry_after = None
+            try:
+                with self._request_slots:
+                    with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                        return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                retryable = exc.code in {408, 429, 500, 502, 503, 504}
+                if not retryable or attempt >= self.max_retries:
+                    raise
+                reason = f"HTTP {exc.code}"
+                if exc.headers is not None:
+                    retry_after = exc.headers.get("Retry-After")
+                exc.close()
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                if attempt >= self.max_retries:
+                    raise
+                reason = type(exc).__name__
+            delay = min(self.retry_backoff_seconds * 2 ** min(attempt, 10), 30.0)
+            if retry_after is not None:
+                try:
+                    seconds = float(retry_after)
+                    if math.isfinite(seconds):
+                        delay = min(max(seconds, 0.0), 30.0)
+                except (TypeError, ValueError):
+                    pass
+            print(f"Embedding request failed ({reason}); retry "
+                  f"{attempt + 1}/{self.max_retries} in {delay:g}s", flush=True)
+            # Release the request slot while waiting so other requests can finish.
+            time.sleep(delay)
 
     def encode(self, texts):
         single = isinstance(texts, str)
         inputs = [texts] if single else list(texts)
+        body = {
+            "model": self.model,
+            "input": inputs,
+            "encoding_format": self.encoding_format,
+        }
+        if self.dimensions is not None:
+            body["dimensions"] = self.dimensions
         request = urllib.request.Request(
             f"{self.base_url}/embeddings",
-            data=json.dumps({
-                "model": self.model,
-                "input": inputs,
-                "encoding_format": self.encoding_format,
-            }).encode("utf-8"),
+            data=json.dumps(body).encode("utf-8"),
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=60) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        payload = self._request(request)
         if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
             raise RuntimeError(f"Invalid embedding response: {str(payload)[:500]}")
         ordered = sorted(payload["data"], key=lambda item: item.get("index", 0))
@@ -307,7 +359,7 @@ def _token_usage_helpers(llm):
 def _initial_population_eoh_recipe(llm, evaluation, info, pop_size,
                                    selection_num=2, num_samplers=1,
                                    debug=False, on_evaluated=None,
-                                   reserve_sample_order=None):
+                                   reserve_sample_order=None, response_encoder=None):
     """Generate the root population with recipe-branch EoH semantics.
 
     This path is used only for the compatibility mode requested by experiments
@@ -316,7 +368,7 @@ def _initial_population_eoh_recipe(llm, evaluation, info, pop_size,
     acceptance order, and retention behavior.  The current branch's token usage
     capture is preserved because it does not change the sampled population.
     """
-    sampler = EoHSampler(llm, info["template_program"])
+    sampler = EoHSampler(llm, info["template_program"], response_encoder=response_encoder)
     evaluator = SecureEvaluator(evaluation, debug_mode=debug)
     individuals = []
     prompt = EoHPrompt.get_prompt_i1(info)
@@ -388,9 +440,9 @@ def _initial_population_eoh_recipe(llm, evaluation, info, pop_size,
 def _initial_population_eoh(llm, evaluation, info, pop_size, selection_num=2,
                             num_samplers=1, debug=False, on_evaluated=None,
                             reserve_sample_order=None,
-                            initial_sample_nums_max=None):
+                            initial_sample_nums_max=None, response_encoder=None):
     """Initialize with the original EoH i1 prompt and greedy survival."""
-    sampler = EoHSampler(llm, info["template_program"])
+    sampler = EoHSampler(llm, info["template_program"], response_encoder=response_encoder)
     evaluator = SecureEvaluator(evaluation, debug_mode=debug)
     prompt = EoHPrompt.get_prompt_i1(info)
     print("===== EoH Initialization Prompt =====", flush=True)
@@ -416,6 +468,8 @@ def _initial_population_eoh(llm, evaluation, info, pop_size, selection_num=2,
         try:
             with capture_token_usage() as evolution_usage:
                 thought, function = sampler.get_thought_and_function(prompt)
+        except NodeEmbeddingError:
+            raise
         except Exception as exc:
             if debug:
                 print(f"DEBUG: EoH initialization sampling failed: {exc}")
@@ -428,6 +482,8 @@ def _initial_population_eoh(llm, evaluation, info, pop_size, selection_num=2,
         try:
             program = TextFunctionProgramConverter.function_to_program(
                 function, info["template_program"])
+        except NodeEmbeddingError:
+            raise
         except Exception as exc:
             if debug:
                 print(f"DEBUG: EoH initialization conversion failed: {exc}")
@@ -502,7 +558,7 @@ def _initial_population_eoh(llm, evaluation, info, pop_size, selection_num=2,
 def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
                         num_samplers=1, debug=False, on_evaluated=None,
                         reserve_sample_order=None, init_pop_size=None,
-                        admit_sample_order=None):
+                        admit_sample_order=None, response_encoder=None):
     """Run RefineEvo's complete initialization pipeline.
 
     RefineEvo does not immediately accept the first ``pop_size`` feasible
@@ -552,7 +608,9 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
             try:
                 with capture_token_usage() as evolution_usage:
                     thought, function = sample_initial_algorithm(
-                        llm, prompt, info["template_program"])
+                        llm, prompt, info["template_program"], response_encoder=response_encoder)
+            except NodeEmbeddingError:
+                raise
             except Exception as exc:
                 last_error = exc
                 thought, function = None, None
@@ -564,6 +622,8 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
             try:
                 program = TextFunctionProgramConverter.function_to_program(
                     function, info["template_program"])
+            except NodeEmbeddingError:
+                raise
             except Exception as exc:
                 last_error = exc
                 program = None
@@ -671,11 +731,38 @@ def run_task(*, method_name, template_module, evaluation, llm,
              depth_balance_weight=0.2, node_batch_size=100, seed=None,
              experiment_config=None, initialization_mode="refineevo",
              initial_sample_nums_max=None, task_type=None,
-             post_training_test_config=None, adaptive_config=None):
+             post_training_test_config=None, adaptive_config=None,
+             node_embedding_config=None):
     from example.tasks.utils import get_info
 
     info = get_info(method_name, template_module)
     info["template_module"] = template_module
+    node_embedding_config = dict(node_embedding_config or {})
+    node_embedding_model = None
+    response_encoder = None
+    node_embedding_options = {}
+    if node_embedding_config.get("enabled", False):
+        node_embedding_options = {
+            "enabled": True,
+            "base_url": node_embedding_config.get("base_url", "https://api.apilio.ai/v1"),
+            "model": node_embedding_config.get("model", "text-embedding-v4"),
+            "dimensions": int(node_embedding_config.get("dimensions", 64)),
+            "encoding_format": "float",
+            "aggregation": "population_mean",
+            "selection": node_embedding_config.get("selection", "individual_single_vote"),
+        }
+        node_embedding_model = OpenAIEmbedding(
+            api_key=_secret(node_embedding_config),
+            base_url=node_embedding_options["base_url"],
+            model=node_embedding_options["model"],
+            dimensions=node_embedding_options["dimensions"],
+            max_retries=int(node_embedding_config.get("max_retries", 4)),
+            retry_backoff_seconds=float(node_embedding_config.get("retry_backoff_seconds", 1.0)),
+            timeout_seconds=float(node_embedding_config.get("timeout_seconds", 60)),
+            max_concurrent_requests=int(node_embedding_config.get("max_concurrent_requests", 2)),
+        )
+        response_encoder = NodeEmbedding(
+            node_embedding_model, node_embedding_options["dimensions"]).encode_response
     if checkpoint:
         store_dir = Path(checkpoint).resolve().parent
     store_dir = Path(store_dir).resolve()
@@ -731,6 +818,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
             "task_type": task_type,
             "post_training_test_config": post_training_test_config,
             "adaptive_config": adaptive_config,
+            "node_embedding_config": node_embedding_options,
         },
         recipes=recipes,
     )
@@ -775,6 +863,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
             num_evaluators=num_evaluators,
             debug_mode=debug,
             operators=operators,
+            response_encoder=response_encoder,
             **kwargs,
         )
     method = MCTSRecipe(
@@ -791,6 +880,8 @@ def run_task(*, method_name, template_module, evaluation, llm,
         max_sample_count=max_sample_count,
         elite_pool_size=elite_pool_size,
         adaptive_config=adaptive_config,
+        node_embedding_model=node_embedding_model,
+        node_embedding_config=node_embedding_options,
     )
     try:
         if checkpoint:
@@ -807,6 +898,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
                         num_samplers, debug,
                         on_evaluated=init_callback,
                         reserve_sample_order=method.reserve_sample_order,
+                        response_encoder=response_encoder,
                     )
                 else:
                     initial, initial_token_usage = _initial_population_eoh(
@@ -815,6 +907,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
                         on_evaluated=init_callback,
                         reserve_sample_order=method.reserve_sample_order,
                         initial_sample_nums_max=initial_sample_nums_max,
+                        response_encoder=response_encoder,
                     )
             else:
                 initial, initial_token_usage = _initial_population(
@@ -823,6 +916,7 @@ def run_task(*, method_name, template_module, evaluation, llm,
                     on_evaluated=init_callback,
                     reserve_sample_order=method.reserve_sample_order,
                     init_pop_size=init_pop_size,
+                    response_encoder=response_encoder,
                 )
         result = method.run(
             initial_individuals=initial,
@@ -881,4 +975,5 @@ def common_options(default_log, config=None):
         "experiment_config": config,
         "post_training_test_config": test_config(config),
         "adaptive_config": _section(config, "adaptive"),
+        "node_embedding_config": _section(config, "node_embedding"),
     }

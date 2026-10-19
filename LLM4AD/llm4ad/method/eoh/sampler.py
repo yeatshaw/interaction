@@ -9,24 +9,34 @@ from ...base.modify_code import ModifyCode
 
 
 class EoHSampler:
-    def __init__(self, llm: LLM, template_program: str | Program):
+    def __init__(self, llm: LLM, template_program: str | Program,
+                 response_encoder=None):
         self.llm = llm
         self._template_program = template_program
+        self._response_encoder = response_encoder
 
     def get_thought_and_function(self, prompt: str) -> Tuple[str, Function]:
         response = self.llm.draw_sample(prompt)
+        embedding = self._response_encoder(response) if self._response_encoder else None
         thought = self.__class__.trim_thought_from_response(response)
         code = self.__class__.trim_code_from_response(response)
 
         function = SampleTrimmer.sample_to_function(code, self._template_program)
+        if function is not None:
+            function._generation_raw_response = response
+            function._node_embedding = embedding
         return thought, function
 
     def get_recipe_thought_and_function(self, prompt: str) -> Tuple[str, Function]:
         response = self.llm.draw_sample(prompt)
+        embedding = self._response_encoder(response) if self._response_encoder else None
         thought = self.__class__.trim_recipe_thought_from_response(response)
         code = self.__class__.trim_code_from_response(response)
 
         function = SampleTrimmer.sample_to_function(code, self._template_program)
+        if function is not None:
+            function._generation_raw_response = response
+            function._node_embedding = embedding
         return thought, function
 
     @classmethod

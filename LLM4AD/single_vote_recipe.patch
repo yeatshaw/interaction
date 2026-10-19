@@ -1,0 +1,346 @@
+--- a/LLM4AD/llm4ad/method/recipe_selection.py
++++ b/LLM4AD/llm4ad/method/recipe_selection.py
+@@ -175,12 +175,8 @@
+                 reverse=True)[:k]
+             return selected, values
+ 
+-    def select_population_top_k(self, states, candidate_ids, k=3, samples=256):
+-        """Average individual TS win probabilities, then take the top k arms.
+-
+-        Each Monte Carlo draw uses one posterior parameter vector per arm
+-        across all individuals. Probabilities are conditional on candidate_ids.
+-        """
++    def select_population_top_k(self, states, candidate_ids, k=3):
++        """One independent Thompson sample and one vote per individual."""
+         if self.strategy != "linear_thompson_sampling":
+             raise ValueError("Individual voting currently requires linear_thompson_sampling")
+         candidates = list(dict.fromkeys(str(value) for value in candidate_ids))
+@@ -188,10 +184,7 @@
+         if unknown:
+             raise KeyError(f"Unknown recipe ids: {sorted(unknown)}")
+         if not candidates:
+-            return [], {"probabilities": {}, "individual_probabilities": []}
+-        samples = int(samples)
+-        if samples < 1:
+-            raise ValueError("voting_samples must be positive")
++            return [], {"vote_counts": {}, "individual_votes": []}
+         if len(states) == 0:
+             raise ValueError("Individual voting requires a non-empty population")
+         features = np.asarray([self._features(state) for state in states])
+@@ -205,26 +198,22 @@
+                 covariance = (covariance + covariance.T) / 2.0
+                 covariance += 1e-10 * np.eye(covariance.shape[0])
+                 theta = np.random.multivariate_normal(
+-                    mean, covariance, size=samples, check_valid="ignore")
+-                scores.append(theta @ features.T)
+-            scores = np.stack(scores, axis=-1)  # [draw, individual, recipe]
++                    mean, covariance, size=len(features), check_valid="ignore")
++                scores.append(np.sum(theta * features, axis=1))
++            scores = np.stack(scores, axis=-1)  # [individual, recipe]
+             # Randomize exact score ties rather than favoring recipe order.
+             ties = scores == np.max(scores, axis=-1, keepdims=True)
+             winners = np.argmax(np.where(ties, np.random.random(scores.shape), -1), axis=-1)
+-            individual = np.stack([
+-                np.mean(winners == index, axis=0)
+-                for index in range(len(candidates))
+-            ], axis=-1)
+-            probabilities = dict(zip(candidates, np.mean(individual, axis=0).tolist()))
++            votes = {arm: int(np.count_nonzero(winners == index))
++                     for index, arm in enumerate(candidates)}
+             tie_breaks = {arm: random.random() for arm in candidates}
+             selected = sorted(
+-                candidates, key=lambda arm: (probabilities[arm], tie_breaks[arm]),
++                candidates, key=lambda arm: (votes[arm], tie_breaks[arm]),
+                 reverse=True)[:k]
+         return selected, {
+-            "probabilities": probabilities,
+-            "individual_probabilities": [dict(zip(candidates, row.tolist()))
+-                                         for row in individual],
+-            "samples": samples,
++            "vote_counts": votes,
++            "individual_votes": [candidates[index] for index in winners],
++            "samples_per_individual": 1,
+         }
+ 
+     def update_population(self, recipe_id, states, reward):
+--- a/LLM4AD/llm4ad/method/mcts_recipe/mcts_recipe.py
++++ b/LLM4AD/llm4ad/method/mcts_recipe/mcts_recipe.py
+@@ -70,12 +70,9 @@
+         self.node_embedding_config = dict(node_embedding_config or {})
+         self.node_embedding = None
+         if self.node_embedding_config.get("enabled", False):
+-            self.node_embedding_config.setdefault("selection", "individual_voting")
+-            self.node_embedding_config.setdefault("voting_samples", 256)
+-            if self.node_embedding_config["selection"] not in {"individual_voting", "population_mean"}:
++            self.node_embedding_config.setdefault("selection", "individual_single_vote")
++            if self.node_embedding_config["selection"] not in {"individual_single_vote", "population_mean"}:
+                 raise ValueError("Unknown node embedding selection mode")
+-            if int(self.node_embedding_config["voting_samples"]) < 1:
+-                raise ValueError("voting_samples must be positive")
+             from .node_embedding import NodeEmbedding
+             if node_embedding_model is None:
+                 raise ValueError("node_embedding_model is required when enabled")
+@@ -86,7 +83,9 @@
+             self.adaptive_config.get("enabled", False))
+         self.individual_voting = (
+             self.node_embedding is not None
+-            and self.node_embedding_config["selection"] == "individual_voting")
++            and self.node_embedding_config["selection"] == "individual_single_vote")
++        self.allow_recipe_repeats = bool(
++            self.adaptive_config.get("allow_recipe_repeats", False))
+         if (self.individual_voting and self.adaptive_enabled
+                 and self.adaptive_config.get("strategy", "linear_thompson_sampling")
+                 != "linear_thompson_sampling"):
+@@ -108,7 +107,8 @@
+         self.depth_balance_weight = float(depth_balance_weight)
+         self.tree = RecipeMCTS(
+             self.recipes, exploration_constant, max_depth,
+-            depth_balance_weight=self.depth_balance_weight)
++            depth_balance_weight=self.depth_balance_weight,
++            allow_recipe_repeats=self.allow_recipe_repeats)
+         self.store = RecipeStore(store_dir, node_batch_size)
+         # All recipe-MCTS variants share the disk-backed tree index. The
+         # selected node's population snapshot is loaded only when expanded.
+@@ -524,7 +524,7 @@
+         pending_recipes = [
+             (recipe_id, recipe)
+             for recipe_id, recipe in self.recipes.items()
+-            if recipe_id not in node.expanded_recipe_ids
++            if self.allow_recipe_repeats or recipe_id not in node.expanded_recipe_ids
+         ]
+         if not pending_recipes:
+             raise RuntimeError(
+@@ -540,13 +540,12 @@
+                     individual_contexts,
+                     [recipe_id for recipe_id, _ in pending_recipes],
+                     k=self.adaptive_recipe_count,
+-                    samples=self.node_embedding_config["voting_samples"],
+                 )
+                 selection_record["selected_ids"] = list(selected_ids)
+                 selection_record["parent_algorithm_ids"] = [
+                     getattr(function, "_recipe_algorithm_id", None)
+                     for function in population.individuals]
+-                sampled_recipe_values = selection_record["probabilities"]
++                sampled_recipe_values = selection_record["vote_counts"]
+             else:
+                 adaptive_state = self._adaptive_state(node, population)
+                 selected_ids, sampled_recipe_values = self.adaptive_router.select_top_k(
+@@ -562,7 +561,7 @@
+             ]
+             print(
+                 f"Adaptive recipe selection node={node.population_node_id} "
+-                f"probabilities={sampled_recipe_values} selected="
++                f"votes_or_scores={sampled_recipe_values} selected="
+                 f"{[recipe_id for recipe_id, _ in pending_recipes]}",
+                 flush=True,
+             )
+@@ -810,7 +809,7 @@
+             if int(item.get("depth", 0)) >= self.max_depth:
+                 continue
+             expanded = set(item.get("expanded_recipe_ids", []))
+-            if len(expanded) < recipe_count:
++            if self.allow_recipe_repeats or len(expanded) < recipe_count:
+                 candidates.append(item)
+         if not candidates:
+             return None
+@@ -831,7 +830,7 @@
+             return exploit + self.tree.exploration_constant * math.sqrt(
+                 math.log(parent_visits + 1.0) / visits)
+ 
+-        if self.depth_balance_weight == 0.0:
++        if self.depth_balance_weight == 0.0 and not self.allow_recipe_repeats:
+             current = records[root_id]
+             while children.get(int(current["population_node_id"]), []):
+                 current_children = children[int(current["population_node_id"])]
+@@ -858,7 +857,12 @@
+                 candidates,
+                 key=lambda item: (
+                     uct(item, children.get(int(item["parent_population_node_id"]), []))
+-                    if item.get("parent_population_node_id") is not None else float("inf")
++                    if item.get("parent_population_node_id") is not None else
++                    (self.tree.exploration_constant * math.sqrt(
++                        math.log(float(item.get("visits", 1)) + 1.0)
++                        / max(float(item.get("visits", 1)), 1.0))
++                     if self.allow_recipe_repeats and children.get(root_id)
++                     else float("inf"))
+                 ) + self.depth_balance_weight * (
+                     (max_count - depth_counts.get(int(item.get("depth", 0)), 0))
+                     / (max_count + 1.0)
+@@ -990,6 +994,8 @@
+                             if self.use_elite_pool else [])
+         adaptive_state = state.get("adaptive")
+         if isinstance(adaptive_state, dict):
++            if bool(adaptive_state.get("allow_recipe_repeats", False)) != self.allow_recipe_repeats:
++                raise ValueError("allow_recipe_repeats differs from checkpoint; start a new run")
+             self.adaptive_enabled = bool(
+                 adaptive_state.get("enabled", self.adaptive_enabled))
+             self.adaptive_recipe_count = int(
+@@ -1109,6 +1115,7 @@
+             "adaptive": {
+                 "enabled": self.adaptive_enabled,
+                 "recipes_per_expansion": self.adaptive_recipe_count,
++                "allow_recipe_repeats": self.allow_recipe_repeats,
+                 "strategy": (self.adaptive_router.strategy
+                              if self.adaptive_router is not None else
+                              self.adaptive_config.get(
+--- a/LLM4AD/llm4ad/method/mcts_recipe/mcts.py
++++ b/LLM4AD/llm4ad/method/mcts_recipe/mcts.py
+@@ -33,10 +33,11 @@
+ 
+ class RecipeMCTS:
+     def __init__(self, recipes, exploration_constant=0.1, max_depth=50,
+-                 depth_balance_weight=0.0):
++                 depth_balance_weight=0.0, allow_recipe_repeats=False):
+         self.recipes = dict(recipes)
+         self.exploration_constant = float(exploration_constant)
+         self.max_depth = int(max_depth)
++        self.allow_recipe_repeats = bool(allow_recipe_repeats)
+         # Rewards depths that have received fewer visits. This is deliberately
+         # separate from UCT's score and child-level exploration terms.
+         self.depth_balance_weight = float(depth_balance_weight)
+@@ -50,6 +51,9 @@
+ 
+     def uct(self, node, q_min=None, q_max=None):
+         if node.parent is None:
++            if self.allow_recipe_repeats and node.children:
++                return self.exploration_constant * math.sqrt(
++                    math.log(node.visits + 1.0) / max(node.visits, 1))
+             return float("inf")
+         siblings = node.parent.children
+         q_min = min((x.Q for x in siblings), default=node.Q) if q_min is None else q_min
+@@ -69,7 +73,7 @@
+             node = stack.pop()
+             if node.depth >= self.max_depth:
+                 continue
+-            if len(node.expanded_recipe_ids) < len(self.recipes):
++            if self.allow_recipe_repeats or len(node.expanded_recipe_ids) < len(self.recipes):
+                 result.append(node)
+             stack.extend(node.children)
+         return result
+@@ -84,7 +88,7 @@
+         candidates = self._expandable_nodes()
+         if not candidates:
+             return self.root
+-        if self.depth_balance_weight == 0.0:
++        if self.depth_balance_weight == 0.0 and not self.allow_recipe_repeats:
+             # Preserve the original root-to-leaf UCT behavior by default.
+             node = self.root
+             while node.children and node.depth < self.max_depth:
+--- a/LLM4AD/example/tasks/mcts_recipe_runner.py
++++ b/LLM4AD/example/tasks/mcts_recipe_runner.py
+@@ -695,8 +695,7 @@
+             "dimensions": int(node_embedding_config.get("dimensions", 64)),
+             "encoding_format": "float",
+             "aggregation": "population_mean",
+-            "selection": node_embedding_config.get("selection", "individual_voting"),
+-            "voting_samples": int(node_embedding_config.get("voting_samples", 256)),
++            "selection": node_embedding_config.get("selection", "individual_single_vote"),
+         }
+         node_embedding_model = OpenAIEmbedding(
+             api_key=_secret(node_embedding_config),
+--- a/LLM4AD/example/tasks/tsp_construct/mcts_recipe_config.py
++++ b/LLM4AD/example/tasks/tsp_construct/mcts_recipe_config.py
+@@ -25,7 +25,8 @@
+     "adaptive": {
+         "enabled": True,
+         "strategy": "linear_thompson_sampling",
+-        "recipes_per_expansion": 3,
++        "recipes_per_expansion": 3,  # top-k recipes by individual vote count
++        "allow_recipe_repeats": False,  # True allows reuse in later expansions of the same node.
+         "prior_precision": 1.0,
+         "posterior_scale": 0.5,
+         "discount_factor": 0.9,
+@@ -50,8 +51,7 @@
+         "api_key_env": ["LLM4AD_NODE_EMBEDDING_API_KEY", "LLM4AD_API_KEY"],
+         "model": "text-embedding-v4",
+         "dimensions": 64,
+-        "selection": "individual_voting",
+-        "voting_samples": 256,  # MC draws per individual to estimate recipe probabilities.
++        "selection": "individual_single_vote",
+     },
+     # Independent embedding client for RefineEvo experience retrieval.
+     "embedding": {
+--- a/LLM4AD/tests/test_recipe_node_embedding.py
++++ b/LLM4AD/tests/test_recipe_node_embedding.py
+@@ -83,46 +83,36 @@
+         with self.assertRaises(ValueError):
+             RecipeSelector(["a", "b"]).load_state_dict(selector.state_dict())
+ 
+-    def test_individual_probability_votes_choose_top_three(self):
+-        arms = ["a", "b", "c", "d", "e"]
+-        selector = RecipeSelector(arms, context_dim=5)
+-        contexts = np.eye(5).tolist()
+-        # Known posterior draws give 20 individual votes: 8, 6, 4, 2, 0.
+-        winners = np.asarray([[0, 0, 1, 1, 2], [0, 0, 1, 2, 3],
+-                              [0, 0, 1, 2, 3], [0, 0, 1, 1, 2]])
+-        draws = [np.column_stack((np.zeros(4), 10 * (winners == arm)))
++    def test_single_vote_top_k(self):
++        selector = RecipeSelector(["a", "b", "c", "d", "e"], context_dim=1)
++        winners = np.asarray([0, 0, 1, 1, 2])
++        draws = [np.column_stack((10 * (winners == arm), np.zeros(5)))
+                  for arm in range(5)]
+-        with patch("numpy.random.multivariate_normal", side_effect=draws):
++        with patch("numpy.random.multivariate_normal", side_effect=draws) as sampler:
+             selected, details = selector.select_population_top_k(
+-                contexts, arms, k=3, samples=4)
+-        self.assertEqual(selected, ["a", "b", "c"])
+-        np.testing.assert_allclose(list(details["probabilities"].values()),
+-                                   [0.4, 0.3, 0.2, 0.1, 0])
+-        self.assertEqual(len(details["individual_probabilities"]), 5)
+-        for individual_votes in details["individual_probabilities"]:
+-            self.assertAlmostEqual(sum(individual_votes.values()), 1)
+-        with patch("numpy.random.multivariate_normal", side_effect=draws):
+-            _, reversed_details = selector.select_population_top_k(
+-                contexts[::-1], arms, k=3, samples=4)
+-        self.assertEqual(details["probabilities"], reversed_details["probabilities"])
+-        selected, details = selector.select_population_top_k(
+-            contexts, ["c"], k=3, samples=4)
++                [[0]] * 5, list(selector.recipe_ids), k=3)
++        self.assertEqual(set(selected), {"a", "b", "c"})
++        self.assertEqual(details["vote_counts"], {"a": 2, "b": 2, "c": 1, "d": 0, "e": 0})
++        self.assertEqual(details["individual_votes"], ["a", "a", "b", "b", "c"])
++        self.assertEqual(sum(details["vote_counts"].values()), 5)
++        for call in sampler.call_args_list:
++            self.assertEqual(call.kwargs["size"], 5)
++        selected, details = selector.select_population_top_k([[0]] * 5, ["c"], k=3)
+         self.assertEqual(selected, ["c"])
+-        self.assertEqual(details["probabilities"], {"c": 1})
++        self.assertEqual(details["vote_counts"], {"c": 5})
+ 
+-    def test_voting_uses_individuals_not_mean_embedding(self):
+-        selector = RecipeSelector(["a", "b"], context_dim=1)
+-        # a wins at x=-1 and x=1, but b wins at the average x=0.
+-        # Use two posterior draws with opposite slopes for a.
+-        draws = [np.asarray([[0, 2], [0, -2]]), np.asarray([[1, 0], [1, 0]])]
+-        with patch("numpy.random.multivariate_normal", side_effect=draws):
+-            _, details = selector.select_population_top_k(
+-                [[-1], [1]], ["a", "b"], k=1, samples=2)
+-        self.assertEqual(details["probabilities"], {"a": 0.5, "b": 0.5})
+-        with patch("numpy.random.multivariate_normal", side_effect=draws):
+-            _, mean_details = selector.select_population_top_k(
+-                [[0]], ["a", "b"], k=1, samples=2)
+-        self.assertEqual(mean_details["probabilities"], {"a": 0, "b": 1})
++    def test_repeat_mode_keeps_nodes_expandable_without_root_starvation(self):
++        from llm4ad.method.mcts_recipe.mcts import RecipeMCTS, RecipeNode
++        tree = RecipeMCTS({"a": {}, "b": {}}, allow_recipe_repeats=True)
++        root = RecipeNode(1, 0, visits=20)
++        child = RecipeNode(2, 1, depth=1, parent=root)
++        root.add_child(child)
++        root.expanded_recipe_ids = {"a", "b"}
++        tree.root = root
++        self.assertIn(root, tree._expandable_nodes())
++        self.assertTrue(np.isfinite(tree.uct(root)))
++        tree.allow_recipe_repeats = False
++        self.assertNotIn(root, tree._expandable_nodes())
+ 
+     def test_node_persistence_parent_context_reward_and_resume(self):
+         with tempfile.TemporaryDirectory() as directory:
+@@ -171,7 +161,7 @@
+             method._write_checkpoint()
+             record = method.store.load_node(child.population_node_id)
+             np.testing.assert_allclose(record["embedding"], [2.5, 5])
+-            self.assertEqual(len(record["recipe_selection"]["individual_probabilities"]), 2)
++            self.assertEqual(len(record["recipe_selection"]["individual_votes"]), 2)
+             self.assertEqual(record["recipe_selection"]["selected_ids"], [child.incoming_recipe_id])
+             self.assertTrue(all("generation_raw_response" in item
+                                 and "embedding" in item for item in record["algorithms"]))

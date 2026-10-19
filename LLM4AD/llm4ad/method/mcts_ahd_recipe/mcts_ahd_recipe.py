@@ -18,6 +18,7 @@ from ..mcts_ahd.prompt import MAEOHPrompt
 from ...base import TextFunctionProgramConverter
 from ..mcts_recipe.refineevo_experience import RefineEvoExperienceManager
 from ..mcts_recipe.recipes import get_default_recipes
+from ..recipe_selection import create_recipe_selector
 from .persistence import MCTSAHDRecipeStore
 
 
@@ -36,7 +37,7 @@ class MCTS_AHD_Recipe(MCTS_AHD):
                  recipe_temperature=1.0, recipe_batch_expansion=True,
                  recipes_per_node=5, embedding_model=None,
                  state_dir=None, node_batch_size=100,
-                 expansion_workers=30, **kwargs):
+                 expansion_workers=30, adaptive_config=None, **kwargs):
         self._info = dict(info or {})
         if not self._info:
             raise ValueError("info is required for EoH-style recipe prompts")
@@ -78,6 +79,19 @@ class MCTS_AHD_Recipe(MCTS_AHD):
         self._expansion_workers = expansion_workers
         self._recipe_gain = {name: 0.0 for name in self._recipes}
         self._recipe_count = {name: 0 for name in self._recipes}
+        self._adaptive_config = dict(adaptive_config or {})
+        self._adaptive_enabled = bool(
+            self._adaptive_config.get("enabled", False))
+        if self._adaptive_enabled:
+            self._recipes_per_node = int(self._adaptive_config.get(
+                "recipes_per_expansion", self._recipes_per_node))
+            if not 1 <= self._recipes_per_node <= len(self._recipes):
+                raise ValueError(
+                    "adaptive recipes_per_expansion must be between 1 and "
+                    "the number of configured recipes")
+        self._recipe_selector = (
+            create_recipe_selector(self._recipes, self._adaptive_config)
+            if self._adaptive_enabled else None)
         self._recipe_lock = threading.RLock()
         if state_dir is None:
             state_dir = os.path.join(
@@ -263,6 +277,12 @@ class MCTS_AHD_Recipe(MCTS_AHD):
             "tree_state_file": "tree_state.json",
             "recipe_gain": dict(self._recipe_gain),
             "recipe_count": dict(self._recipe_count),
+            "adaptive": {
+                "enabled": self._adaptive_enabled,
+                "recipes_per_expansion": self._recipes_per_node,
+                "selector": (self._recipe_selector.state_dict()
+                             if self._recipe_selector is not None else None),
+            },
             "cumulative_token_usage": dict(self._cumulative_token_usage),
             "convergence_records": list(self._convergence_records),
             "best_so_far": (self._best_so_far
@@ -530,6 +550,29 @@ class MCTS_AHD_Recipe(MCTS_AHD):
         self._tot_sample_nums = int(state.get("total_sample_nums", 0))
         self._recipe_gain.update(state.get("recipe_gain", {}))
         self._recipe_count.update(state.get("recipe_count", {}))
+        adaptive_state = state.get("adaptive", {})
+        selector_state = adaptive_state.get("selector")
+        if "recipes_per_expansion" in adaptive_state:
+            self._recipes_per_node = int(
+                adaptive_state["recipes_per_expansion"])
+        if selector_state:
+            self._adaptive_enabled = bool(
+                adaptive_state.get("enabled", self._adaptive_enabled))
+            if self._adaptive_enabled:
+                if selector_state.get("strategy"):
+                    selector_config = dict(self._adaptive_config)
+                    selector_config.update({
+                        key: selector_state[key]
+                        for key in ("strategy", "prior_precision", "posterior_scale",
+                                    "discount_factor", "window_size", "exploration")
+                        if key in selector_state
+                    })
+                    self._recipe_selector = create_recipe_selector(
+                        self._recipes, selector_config)
+                elif self._recipe_selector is None:
+                    self._recipe_selector = create_recipe_selector(
+                        self._recipes, self._adaptive_config)
+                self._recipe_selector.load_state_dict(selector_state)
         self._cumulative_token_usage.update(
             state.get("cumulative_token_usage", {}))
         self._convergence_records = list(state.get("convergence_records", []))
@@ -590,13 +633,28 @@ class MCTS_AHD_Recipe(MCTS_AHD):
         total = sum(weights)
         return weights[names.index(recipe_id)] / total
 
-    def _choose_recipe_batch(self):
+    def _adaptive_context(self, node):
+        scores = [float(item.score) for item in self._population.population
+                  if getattr(item, "score", None) is not None]
+        if not scores:
+            scores = [0.0]
+        mean = sum(scores) / len(scores)
+        variance = sum((value - mean) ** 2 for value in scores) / len(scores)
+        return [float(node.depth), 0.0, max(scores), mean, variance ** 0.5]
+
+    def _choose_recipe_batch(self, node=None):
         """Select distinct recipes for one parent-node expansion batch."""
         available = list(self._recipes)
+        if self._recipe_selector is not None:
+            state = self._adaptive_context(node)
+            selected, _ = self._recipe_selector.select_top_k(
+                state, available, k=self._recipes_per_node)
+            probability = 1.0 / len(selected) if selected else 0.0
+            return [(recipe_id, probability, state) for recipe_id in selected]
         selected = []
         for _ in range(self._recipes_per_node):
             recipe_id, probability = self._choose_recipe(available)
-            selected.append((recipe_id, probability))
+            selected.append((recipe_id, probability, None))
             available.remove(recipe_id)
         return selected
 
@@ -739,7 +797,8 @@ class MCTS_AHD_Recipe(MCTS_AHD):
                                     operator, refs, recipe_id, probability,
                                     parent_experiences=None,
                                     retrieved_experiences=None,
-                                    fresh_experiences=None):
+                                    fresh_experiences=None,
+                                    adaptive_state=None):
         if func is False or func is None or func.score is None:
             return node_set
         if self.check_duplicate(node_set, str(func)):
@@ -755,6 +814,8 @@ class MCTS_AHD_Recipe(MCTS_AHD):
         with self._recipe_lock:
             self._recipe_gain[recipe_id] += gain
             self._recipe_count[recipe_id] += 1
+            if self._recipe_selector is not None:
+                self._recipe_selector.update(recipe_id, adaptive_state, gain)
         # Parent IDs are persisted as the durable lineage.  Keep lightweight
         # prompt references in memory instead of recursively copying parents.
         func._recipe_parent_functions = tuple(refs)
@@ -808,7 +869,13 @@ class MCTS_AHD_Recipe(MCTS_AHD):
         else:
             refs = [self._reference_copy(cur_node.individual)]
 
-        if recipe_id is None:
+        adaptive_state = (self._adaptive_context(cur_node)
+                          if self._recipe_selector is not None else None)
+        if recipe_id is None and self._recipe_selector is not None:
+            selected, _ = self._recipe_selector.select_top_k(
+                adaptive_state, self._recipes, k=1)
+            recipe_id, probability = selected[0], 1.0
+        elif recipe_id is None:
             recipe_id, probability = self._choose_recipe()
         else:
             if recipe_id not in self._recipes:
@@ -844,7 +911,7 @@ class MCTS_AHD_Recipe(MCTS_AHD):
             return self._register_expanded_function(
                 mcts, node_set, cur_node, func, option, refs,
                 recipe_id, probability, parent_experiences,
-                retrieved_experiences, fresh_experiences)
+                retrieved_experiences, fresh_experiences, adaptive_state)
         except Exception:
             if self._debug_mode:
                 traceback.print_exc()
@@ -937,6 +1004,7 @@ class MCTS_AHD_Recipe(MCTS_AHD):
                 "parent_experiences": parent_experiences,
                 "retrieved_experiences": retrieved,
                 "fresh_experiences": fresh,
+                "adaptive_state": task.get("adaptive_state"),
             }
         except Exception:
             if self._debug_mode:
@@ -963,7 +1031,7 @@ class MCTS_AHD_Recipe(MCTS_AHD):
             getattr(cur_node, "_refineevo_experiences", []) or [])
         tasks = []
         operator_round = ("e2", "m1", "m1", "m2", "m2", "s1")
-        for recipe_id, probability in self._choose_recipe_batch():
+        for recipe_id, probability, adaptive_state in self._choose_recipe_batch(cur_node):
             for operator in operator_round:
                 if operator == "e2":
                     other = population_snapshot.selection(
@@ -975,6 +1043,7 @@ class MCTS_AHD_Recipe(MCTS_AHD):
                 tasks.append({
                     "recipe_id": recipe_id,
                     "recipe_probability": probability,
+                    "adaptive_state": adaptive_state,
                     "operator": operator,
                     "refs": refs,
                     "parent_experiences": copy.deepcopy(parent_experiences),
@@ -1010,6 +1079,7 @@ class MCTS_AHD_Recipe(MCTS_AHD):
                 result.get("parent_experiences"),
                 result.get("retrieved_experiences"),
                 result.get("fresh_experiences"),
+                result.get("adaptive_state"),
             )
             if len(node_set) > before_count:
                 self._record_convergence(

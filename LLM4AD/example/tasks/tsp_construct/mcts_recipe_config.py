@@ -1,7 +1,7 @@
 """Editable Recipe-MCTS configuration for the TSP task."""
 
 MCTS_RECIPE_CONFIG = {
-    "log_dir": "logs/mcts_recipe_tsp",
+    "log_dir": "logs/mcts_recipe_tsp_v4_10171",
     "checkpoint": None,
     "mode": "reflection",
     "operators": ("e1", "e2", "m1", "m2"),
@@ -9,24 +9,29 @@ MCTS_RECIPE_CONFIG = {
         "pop_size": 5,
         "selection_num": 2,
         "max_depth": 50,
-        "max_sample_count": 10000,
-        "initialization_mode": "refineevo",
+        "max_sample_count": 5000,
+        "initialization_mode": "eoh",
         "initial_sample_nums_max": None,
         "init_pop_size": 30,
         "num_samplers": 5,
         "num_evaluators": 5,
         "exploration_constant": 0.2,
         "depth_balance_weight": 0.4,
-        "node_batch_size": 100,
+        "node_batch_size": 10,
         "seed": None,
-        "elite_pool_size": 20,
+        "elite_pool_size": 0,
         "debug": False,
     },
     "adaptive": {
         "enabled": False,
-        "recipes_per_expansion": 3,
+        "strategy": "linear_thompson_sampling",
+        "recipes_per_expansion": 3,  # top-k recipes by individual vote count
+        "allow_recipe_repeats": False,  # True allows reuse in later expansions of the same node.
         "prior_precision": 1.0,
         "posterior_scale": 0.5,
+        "discount_factor": 0.9,
+        "window_size": 50,
+        "exploration": 1.0,
         "reward_best_weight": 0.8,
         "reward_mean_weight": 0.2,
     },
@@ -37,6 +42,22 @@ MCTS_RECIPE_CONFIG = {
         "model": "gpt-4o-mini",
         "timeout": 60,
     },
+    # Used only for node context in the adaptive recipe selector.
+    # dimensions is requested from the service, which must support this value.
+    "node_embedding": {
+        "enabled": False,
+        "base_url": "https://api.apilio.ai/v1",
+        "api_key": "",
+        "api_key_env": ["LLM4AD_NODE_EMBEDDING_API_KEY", "LLM4AD_API_KEY"],
+        "model": "text-embedding-3-small",
+        "dimensions": 64,
+        "selection": "individual_single_vote",
+        "max_retries": 4,  # Up to 5 attempts for the same generation response.
+        "retry_backoff_seconds": 1.0,
+        "timeout_seconds": 60,
+        "max_concurrent_requests": 2,
+    },
+    # Independent embedding client for RefineEvo experience retrieval.
     "embedding": {
         "base_url": "https://api.apilio.ai/v1",
         "api_key": "",
@@ -46,7 +67,7 @@ MCTS_RECIPE_CONFIG = {
         "top_k": 3,
     },
     "evaluation": {
-        "mode": "refineevo",
+        "mode": "eoh",
         "timeout_seconds": 300,
         "n_instance": 50,
         "problem_size": 100,

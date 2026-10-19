@@ -62,6 +62,7 @@ class RecipeStore:
                      if hasattr(individual, "to_code_without_docstring")
                      else str(individual)),
             "recipe_id": getattr(individual, "_recipe_id", None),
+            "embedding": getattr(individual, "_node_embedding", None),
         }
 
     def add(self, node_id, parent_id, depth, recipe_id, generation, population,
