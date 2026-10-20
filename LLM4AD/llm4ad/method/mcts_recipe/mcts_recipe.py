@@ -642,8 +642,8 @@ class MCTSRecipe:
                     score_std=child_std,
                 )
                 node.add_child(child)
-                # One completed recipe edge is one visit to its new child and
-                # one additional visit propagated through every ancestor.
+                # Preserve the historical in-memory backpropagation here;
+                # the disk transition applies its same visit increments.
                 self.tree.backpropagate(child)
                 branch_experiences.extend(new_experiences)
                 self._update_elite_pool(child_population.individuals)
@@ -804,14 +804,28 @@ class MCTSRecipe:
             if parent_id is not None:
                 children.setdefault(int(parent_id), []).append(item)
 
+        # Match the original in-memory tree: siblings retain edge completion
+        # order, and the frontier is visited by a stack (last child first).
+        for parent_id, siblings in children.items():
+            order = {
+                int(node_id): index
+                for index, node_id in enumerate(records[parent_id].get(
+                    "children_population_node_ids", []))
+            }
+            siblings.sort(key=lambda item: order.get(
+                int(item["population_node_id"]), len(order)))
+
         recipe_count = len(self.recipes)
         candidates = []
-        for item in records.values():
+        stack = [records[root_id]]
+        while stack:
+            item = stack.pop()
             if int(item.get("depth", 0)) >= self.max_depth:
                 continue
             expanded = set(item.get("expanded_recipe_ids", []))
             if self.allow_recipe_repeats or len(expanded) < recipe_count:
                 candidates.append(item)
+            stack.extend(children.get(int(item["population_node_id"]), []))
         if not candidates:
             return None
 
@@ -842,11 +856,6 @@ class MCTSRecipe:
                     key=lambda item: uct(item, current_children),
                 )
             selected = current
-            if (int(selected.get("depth", 0)) < self.max_depth
-                    and len(set(selected.get("expanded_recipe_ids", []))) < recipe_count):
-                pass
-            else:
-                selected = max(candidates, key=lambda item: float(item.get("Q", 0.0)))
         else:
             depth_counts = {}
             for item in records.values():
@@ -914,11 +923,12 @@ class MCTSRecipe:
             {child.incoming_recipe_id for child in children
              if child.incoming_recipe_id is not None}
         )
-        parent["children_population_node_ids"] = sorted(
-            {int(item.get("population_node_id")) for item in records.values()
-             if item.get("parent_population_node_id") == parent_id}
-            | {int(child.population_node_id) for child in children}
-        )
+        parent["children_population_node_ids"] = list(dict.fromkeys(
+            list(parent.get("children_population_node_ids", []))
+            + [int(item["population_node_id"]) for item in records.values()
+               if item.get("parent_population_node_id") == parent_id]
+            + [int(child.population_node_id) for child in children]
+        ))
         for child in children:
             child_id = int(child.population_node_id)
             records[child_id] = {
@@ -935,16 +945,18 @@ class MCTSRecipe:
                 "score_mean": child.score_mean,
                 "score_std": child.score_std,
             }
-            # RecipeMCTS.backpropagate increments every ancestor once for
-            # each newly created child. Apply the same update to disk
-            # metadata without retaining those ancestors as Python objects.
+            # Preserve September's RecipeMCTS.backpropagate semantics:
+            # non-root ancestors are incremented as both parent and child
+            # on consecutive loop iterations; the root is incremented once.
             propagated_id = parent_id
             child_q = float(child.Q)
             while propagated_id is not None and propagated_id in records:
                 propagated = records[propagated_id]
                 propagated["Q"] = max(float(propagated.get("Q", child_q)),
                                        child_q)
-                propagated["visits"] = int(propagated.get("visits", 1)) + 1
+                increment = (1 if propagated.get("parent_population_node_id")
+                             is None else 2)
+                propagated["visits"] = int(propagated.get("visits", 1)) + increment
                 propagated_id = propagated.get("parent_population_node_id")
         changed_ids = set()
         current_id = parent_id

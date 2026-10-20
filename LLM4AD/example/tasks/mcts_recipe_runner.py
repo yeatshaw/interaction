@@ -601,7 +601,12 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
         # population management.
         last_error = None
         for _ in range(5):
-            sample_order = None
+            # Match the September Recipe-MCTS budget: generation/parsing
+            # failures consume an attempt too. PartEvo's separate evaluation
+            # admission callback still counts only admitted evaluations.
+            sample_order = (reserve_sample_order()
+                            if reserve_sample_order is not None
+                            and admit_sample_order is None else None)
             sample_start = time.time()
             evolution_usage = None
             token_usage = None
@@ -631,8 +636,6 @@ def _initial_population(llm, evaluation, info, pop_size, selection_num=2,
                 continue
             if admit_sample_order is not None:
                 sample_order = admit_sample_order()
-            elif reserve_sample_order is not None:
-                sample_order = reserve_sample_order()
             score, eval_time = evaluator.evaluate_program_record_time(program)
             if score is None or not isinstance(score, (int, float)) \
                     or not math.isfinite(float(score)):

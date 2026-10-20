@@ -10,7 +10,7 @@ MCTS_RECIPE_CONFIG = {
         "selection_num": 2,
         "max_depth": 50,
         "max_sample_count": 5000,
-        "initialization_mode": "eoh",
+        "initialization_mode": "refineevo",
         "initial_sample_nums_max": None,
         "init_pop_size": 30,
         "num_samplers": 5,
